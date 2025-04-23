@@ -1,0 +1,1635 @@
+---
+title: "AXYS Project Grant: Partial Correlations"
+author: "Angela Ching"
+date: "`r Sys.Date()`"
+output: 
+  html_notebook:
+    toc: yes
+---
+
+```{r}
+# Get today's date for saving plots
+date_today <- Sys.Date()
+```
+
+# Packages
+
+```{r packages}
+library(tidyverse)
+library(readxl)
+library(ggplot2)
+library(janitor)      # for data cleaning
+library(scico)        # colour palettes
+library(ggsci)        # colour palettes
+library(ggpubr)       # for scatterplot correlations
+library(psychometric) # masks "select" from dplyr; for CIr()
+library(purrr)        # for mapping heatmaps
+library(reshape2)     # for reshaping data for heatmaps
+library(knitr)
+library(pheatmap)
+library(corrplot)
+library(psych)
+library(lme4)
+library(moments)
+library(gridExtra)
+library(ppcor)       # for partial correlations
+```
+
+# Custom functions
+
+```{r}
+# Correlation tests
+cor.mtest <- function(df, method = "kendall", ...) {
+    n <- ncol(df)
+    mat <- as.matrix(df[, 2:n])
+    cor <- psych::corTest(mat, method = method, adjust = "fdr", use = "pairwise")
+    cormat <- as.matrix(cor$r)
+    pmat <- as.matrix(cor$p)
+    return(list(cormat, pmat, cor))
+}
+```
+
+```{r}
+cor.mtest.partial <- function(df, covariates = NULL, method = "kendall", adjust = "fdr") {
+  # Identify numeric columns and exclude the first two if they are not numeric
+  numeric_cols <- sapply(df, is.numeric)
+  if (!numeric_cols[1] || !numeric_cols[2]) {
+    df <- df[, numeric_cols, drop = FALSE]
+  }
+  
+  # Ensure covariates are part of the dataframe and numeric
+  if (!all(covariates %in% colnames(df))) {
+    stop("Some covariates are not present in the dataframe.")
+  }
+  covariate_vars <- df[, covariates, drop = FALSE]
+  data_vars <- df[, !colnames(df) %in% covariates, drop = FALSE]
+  
+  # Generate all pairs of non-covariate columns
+  var_pairs <- combn(colnames(data_vars), 2, simplify = FALSE)
+  
+  # Function to compute partial correlation for a pair of variables
+  compute_partial_corr <- function(pair) {
+    vars <- cbind(data_vars[, pair], covariate_vars)
+    vars <- na.omit(vars)  # Ensure no NAs for this pair
+    res <- ppcor::pcor.test(vars[, 1], vars[, 2], vars[, -c(1, 2)], method = method)
+    list(var1 = pair[1], var2 = pair[2], estimate = res$estimate, p.value = res$p.value)
+  }
+  
+  # Calculate partial correlations for all pairs
+  results <- purrr::map_dfr(var_pairs, compute_partial_corr)
+  
+  # Adjust p-values for multiple testing
+  results <- results %>%
+    dplyr::mutate(adjusted_p.value = p.adjust(p.value, method = adjust))
+  
+  # Convert results into matrices
+  vars <- colnames(data_vars)
+  cormat <- matrix(NA, nrow = length(vars), ncol = length(vars), dimnames = list(vars, vars))
+  pmat <- matrix(NA, nrow = length(vars), ncol = length(vars), dimnames = list(vars, vars))
+  
+  for (i in seq_len(nrow(results))) {
+    row <- results[i, ]
+    var1_idx <- which(vars == row$var1)
+    var2_idx <- which(vars == row$var2)
+    cormat[var1_idx, var2_idx] <- row$estimate
+    cormat[var2_idx, var1_idx] <- row$estimate
+    pmat[var1_idx, var2_idx] <- row$adjusted_p.value
+    pmat[var2_idx, var1_idx] <- row$adjusted_p.value
+  }
+  
+  return(list(cormat = cormat, pmat = pmat, raw_results = results))
+}
+```
+
+# Load AXYS data
+
+```{r}
+# load chemical list
+chem_list <- read_csv("../../data/2022-10-18_AXYS_chemicals_list_AC.csv") %>%
+  dplyr::select(Compound, Dioxin_subtype) %>%
+  mutate(across(where(is.character), str_squish))
+
+chem_list_2 <- read_csv("../../data/2024-10-01_AXYS_chemicals_list_with_coelutions.csv") %>%
+  dplyr::select(-c(Dioxin_subtype, Type)) %>%
+  mutate(across(where(is.character), str_squish))
+
+# load AXYS data
+axys_pops <- read_csv("../../outputs/2024-08-24_ProjectGrant_excluded_outliers_for_single_analyte_analyses.csv") %>%
+  dplyr::select(-c(CONC_BLANK_adj, IS_BLANK_ADJ_CONC_HIGHER_THAN_LOD)) %>%
+  mutate(BLANK_and_LOD_adj = as.numeric(BLANK_and_LOD_adj),
+         File = factor(File),
+         COMPOUND = case_when(str_detect(COMPOUND, "TOTAL") ~ str_to_sentence(COMPOUND),
+                              str_detect(COMPOUND, " Epoxide") ~ str_to_sentence(COMPOUND),
+                              TRUE ~ COMPOUND),
+         across(where(is.character), str_squish))
+
+axys_pops_2 <- axys_pops %>%
+  dplyr::select(-c(File, LAB_FLAG, DETECTION_LIMIT)) %>%
+  mutate(across(where(is.character), str_squish))
+
+# load AXYS data with imputed values for true NAs (chemicals not measured by AXYS in certain donors)
+axys_pops_imputed_panc <- read_excel("../../outputs/2024-09-03_axys_pops_includes_imputed_values_for_true_NAs_using_mice_package.xlsx", sheet = 1) %>%
+  mutate(across(where(is.character), str_squish))
+
+axys_pops_imputed_adip <- read_excel("../../outputs/2024-09-03_axys_pops_includes_imputed_values_for_true_NAs_using_mice_package.xlsx", sheet = 2) %>%
+  mutate(across(where(is.character), str_squish))
+
+# load AXYS donor metadata
+axys_metadata <- read_csv("../../data/2024-08-22_donor_characteristics_FINAL.csv", show_col_types = FALSE) %>%
+  mutate(BMI_category = case_when(BMI < 24.9 ~ "Lean",
+                                  BMI >= 24.9 & BMI <= 29.9 ~ "Overweight",
+                                  BMI > 29.9 ~ "Obese"),
+         Hba1c_category = case_when(Hba1c < 6 ~ "Normoglycemic",
+                                    Hba1c <= 6.5 ~ "Prediabetic",
+                                    Hba1c > 6.5 ~ "Diabetic"),
+         BMI_category = factor(BMI_category, levels = c("Lean", "Overweight", "Obese")),
+         Hba1c_category = factor(Hba1c_category, levels = c("Normoglycemic", "Prediabetic", "Diabetic")),
+         Sex = as_factor(Sex),
+         Diabetes_status = as_factor(Diabetes_status)) %>%
+  dplyr::select(-Purity)
+
+# Donor IDs
+axys_donors <- axys_metadata %>%
+  dplyr::select(Id)
+
+# Subset data by tissue type
+subset_tissue <- function(tissue) {
+  axys_pops_2 %>%
+    dplyr::filter(!str_detect(COMPOUND, "Total"), TISSUE_TYPE == tissue) %>%
+    dplyr::select(DONOR, COMPOUND, BLANK_and_LOD_adj) %>%
+    group_by(DONOR) %>%
+    pivot_wider(names_from = COMPOUND, values_from = BLANK_and_LOD_adj) %>%
+    ungroup()
+}
+
+axys_pops_panc <- subset_tissue("Pancreas")
+axys_pops_adip <- subset_tissue("Adipose")
+```
+
+# Load data on glucose parameters
+
+## ADI Islet Core: Static GSIS
+
+```{r}
+# load GSIS data from ADI
+gsis_adi_all_ave <- read_excel("../../data/Perifusion+GSIS/2024-05-18_IsletCore_GSIS_from_TeamGrant_website.xlsx") %>%
+  dplyr::mutate_at(c(4:7), as.numeric) %>%
+  group_by(Donor, Cond) %>%
+  dplyr::mutate(Cond = factor(Cond, levels = c("1", "2", "3")),
+                InsulinContent_IsletCore = mean(InsulinContent),
+                LG_IsletCore = mean(LG, na.rm = TRUE),
+                HG_IsletCore = mean(HG, na.rm = TRUE),
+                SI_IsletCore = mean(SI, na.rm = TRUE),
+                .keep = c("unused")) %>%
+  distinct(Donor, Cond, .keep_all = TRUE) %>%
+  dplyr::select(-replicate) %>%
+  ungroup()
+  
+gsis_adi <- gsis_adi_all_ave %>%
+  pivot_wider(names_from = Cond, values_from = c(InsulinContent_IsletCore, LG_IsletCore, HG_IsletCore, SI_IsletCore)) %>%
+  relocate(Donor, InsulinContent_IsletCore_1, LG_IsletCore_1, HG_IsletCore_1, SI_IsletCore_1,
+           InsulinContent_IsletCore_2, LG_IsletCore_2, HG_IsletCore_2, SI_IsletCore_2,
+           InsulinContent_IsletCore_3, LG_IsletCore_3, HG_IsletCore_3, SI_IsletCore_3)
+```
+
+## Jelena Kolic: Glucose, leucine, and fatty acid perifusions
+
+```{r}
+# Load perifusion data from Jelena Kolic
+peri_jk <- read_excel("../../data/Perifusion+GSIS/2024-04-06_Jelena_all_perifusion_AUCs.xlsx") %>%
+ dplyr::mutate(PerifusionParam = str_c("JK", PerifusionParam, sep = "_"),
+         .keep = "unused") %>% 
+  dplyr::mutate_at(c(4:148), as.numeric)
+
+# Separate data based on perifusion type (glucose, leucine, oleate-pamlitate)
+glu_peri_jk <- peri_jk %>%
+  dplyr::filter(Secretagogue == "GLU") %>%
+  remove_empty("cols")
+
+leu_peri_jk <- peri_jk %>%
+  dplyr::filter(Secretagogue == "LEU") %>%
+  remove_empty("cols")
+
+fa_peri_jk <- peri_jk %>%
+  dplyr::filter(Secretagogue == "OLE-PALM") %>%
+  remove_empty("cols")
+
+# Transpose for matrices
+glu_peri_jk_t <- glu_peri_jk %>%
+  dplyr::select(-c(MainOutcome, Secretagogue)) %>%
+  t() %>%
+  as.data.frame() %>%
+  set_names(.[1, ]) %>%
+  slice_tail(., n = (nrow(.)-1)) %>%
+  mutate(Donor = rownames(.),
+         .keep = c("unused")) %>%
+  mutate(Donor = str_remove(Donor, pattern = "Donor"),
+         across(where(is.character), str_squish)) %>%
+  relocate(Donor) %>%
+  mutate_at(c(2:20), as.numeric)
+
+leu_peri_jk_t <- leu_peri_jk %>%
+  dplyr::select(-c(MainOutcome, Secretagogue)) %>%
+  t() %>%
+  as.data.frame() %>%
+  set_names(.[1, ]) %>%
+  slice_tail(., n = (nrow(.)-1)) %>%
+  mutate(Donor = rownames(.),
+         .keep = c("unused")) %>%
+  mutate(Donor = str_remove(Donor, pattern = "Donor"),
+         across(where(is.character), str_squish)) %>%
+  relocate(Donor) %>%
+  mutate_at(c(2:12), as.numeric)
+
+fa_peri_jk_t <- fa_peri_jk %>%
+  dplyr::select(-c(MainOutcome, Secretagogue)) %>%
+  t() %>%
+  as.data.frame() %>%
+  set_names(.[1, ]) %>%
+  slice_tail(., n = (nrow(.)-1)) %>%
+  mutate(Donor = rownames(.),
+         .keep = c("unused")) %>%
+  mutate(Donor = str_remove(Donor, pattern = "Donor"),
+         across(where(is.character), str_squish)) %>%
+  relocate(Donor) %>%
+  mutate_at(c(2:12), as.numeric)
+```
+
+## Bruin Lab: Glucose perifusion
+
+```{r}
+# Load Myriam perifusion data
+glu_peri_mh <- read_excel("../../data/Perifusion+GSIS/2024-01-25_Perifusion_FINAL DATA_For analysis_AC.xlsx") %>%
+  mutate(PerifusionParam = str_c("MH", PerifusionParam, sep = "_"),
+         .keep = c("unused")) %>% 
+  dplyr::mutate_at(c(3:32), as.numeric)
+
+glu_peri_mh_t <- glu_peri_mh %>%
+  dplyr::select(-MainOutcome) %>%
+  t() %>%
+  as.data.frame() %>%
+  set_names(.[1, ]) %>%
+  slice_tail(., n = (nrow(.)-1)) %>%
+  mutate(Donor = rownames(.),
+         .keep = c("unused")) %>%
+  mutate(Donor = str_remove(Donor, pattern = "Donor"),
+         across(where(is.character), str_squish)) %>%
+  relocate(Donor)
+```
+# Analysis prep
+
+## Create compounds lists by class
+
+```{r}
+# Create compounds list
+dioxin_list <- chem_list_2 %>%
+  dplyr::filter(Dioxin_similarity == "Dioxin") %>%
+  dplyr::pull(Compound)
+
+pcb_list <- chem_list_2 %>%
+  dplyr::filter(Dioxin_similarity == "Dioxin-like" | Dioxin_similarity == "Non-dioxin-like") %>%
+  dplyr::pull(Compound)
+
+ocp_list <- chem_list_2 %>%
+  dplyr::filter(Dioxin_similarity == "OCP") %>%
+  dplyr::pull(Compound)
+```
+
+## Calculate dioxin and PCB sums
+
+```{r}
+# Calculate sums
+axys_panc_sums <- axys_pops_panc %>%
+  pivot_longer(cols = c(2:34), names_to = "COMPOUND", values_to = "ADJ_CONC") %>%
+  left_join(., chem_list_2, by = c("COMPOUND" = "Compound")) %>%
+  group_by(DONOR, Dioxin_similarity) %>%
+  mutate(AnalyteSums = sum(ADJ_CONC, na.rm = TRUE)) %>%
+  ungroup() %>%
+  group_by(DONOR, Dioxin_similarity, AnalyteSums) %>%
+  summarise() %>%
+  pivot_wider(names_from = Dioxin_similarity, values_from = AnalyteSums) %>%
+  mutate(PCB = rowSums(across(c("Dioxin-like", "Non-dioxin-like")))) %>%
+  dplyr::select(-OCP) %>%
+  relocate(DONOR, Dioxin, PCB) %>%
+  ungroup()
+
+axys_adip_sums <- axys_pops_adip %>%
+  pivot_longer(cols = c(2:42), names_to = "COMPOUND", values_to = "ADJ_CONC") %>%
+  left_join(., chem_list_2, by = c("COMPOUND" = "Compound")) %>%
+  group_by(DONOR, Dioxin_similarity) %>%
+  mutate(AnalyteSums = sum(ADJ_CONC, na.rm = TRUE)) %>%
+  ungroup() %>%
+  group_by(DONOR, Dioxin_similarity, AnalyteSums) %>%
+  summarise() %>%
+  pivot_wider(names_from = Dioxin_similarity, values_from = AnalyteSums) %>%
+  mutate(PCB = rowSums(across(c("Dioxin-like", "Non-dioxin-like")))) %>%
+  dplyr::select(-OCP) %>%
+  relocate(DONOR, Dioxin, PCB) %>%
+  ungroup()
+```
+
+```{r}
+# Combine single analyte concentrations with sums
+axys_pops_with_sums_panc <- axys_pops_panc %>%
+  left_join(., axys_panc_sums, by = c("DONOR" = "DONOR"))
+
+axys_pops_with_sums_adip <- axys_pops_adip %>%
+  left_join(., axys_adip_sums, by = c("DONOR" = "DONOR"))
+
+# Combine single analyte concentrations with metadata
+axys_pops_with_sums_panc_meta <- axys_pops_with_sums_panc %>%
+  left_join(., axys_metadata, by = c("DONOR" = "Id")) %>%
+  dplyr::select(-Hba1c_category)
+
+axys_pops_with_sums_adip_meta <- axys_pops_with_sums_adip %>%
+  left_join(., axys_metadata, by = c("DONOR" = "Id")) %>%
+  dplyr::select(-Hba1c_category)
+```
+
+## Create separate dataframes for each pollutant class
+
+```{r}
+## Pancreas and adipose POPs without metadata
+
+# Dioxins
+axys_pops_panc_dioxin <- axys_pops_with_sums_panc_meta %>%
+  dplyr::select(DONOR, any_of(dioxin_list), Dioxin)
+
+axys_pops_adip_dioxin <- axys_pops_with_sums_adip_meta %>%
+  dplyr::select(DONOR, any_of(dioxin_list), Dioxin)
+
+# PCBs
+axys_pops_panc_pcb <- axys_pops_with_sums_panc_meta %>%
+  dplyr::select(DONOR, any_of(pcb_list), PCB, "Dioxin-like", "Non-dioxin-like")
+
+axys_pops_adip_pcb <- axys_pops_with_sums_adip_meta %>%
+  dplyr::select(DONOR, any_of(pcb_list), PCB, "Dioxin-like", "Non-dioxin-like")
+
+# PCBs
+axys_pops_panc_ocp <- axys_pops_with_sums_panc_meta %>%
+  dplyr::select(DONOR, any_of(ocp_list))
+
+axys_pops_adip_ocp <- axys_pops_with_sums_adip_meta %>%
+  dplyr::select(DONOR, any_of(ocp_list))
+```
+
+```{r}
+## POPs with metadata
+
+# Dioxins
+axys_pops_panc_dioxin_meta <- axys_pops_with_sums_panc_meta %>%
+  dplyr::select(DONOR, any_of(dioxin_list), Dioxin, Age, BMI)
+
+axys_pops_adip_dioxin_meta <- axys_pops_with_sums_adip_meta %>%
+  dplyr::select(DONOR, any_of(dioxin_list), Dioxin, Age, BMI)
+
+# PCBs
+axys_pops_panc_pcb_meta <- axys_pops_with_sums_panc_meta %>%
+  dplyr::select(DONOR, any_of(pcb_list), PCB, "Dioxin-like", "Non-dioxin-like", Age, BMI)
+
+axys_pops_adip_pcb_meta <- axys_pops_with_sums_adip_meta %>%
+  dplyr::select(DONOR, any_of(pcb_list), PCB, "Dioxin-like", "Non-dioxin-like", Age, BMI)
+
+# OCPs
+axys_pops_panc_ocp_meta <- axys_pops_with_sums_panc_meta %>%
+  dplyr::select(DONOR, any_of(ocp_list), Age, BMI)
+
+axys_pops_adip_ocp_meta <- axys_pops_with_sums_adip_meta %>%
+  dplyr::select(DONOR, any_of(ocp_list), Age, BMI)
+```
+
+# Partial correlations
+
+## Correlate analyte concentrations within each pollutant class
+
+```{r}
+## Create lists with the combined dataframes (POPs data + donor characteristics)
+# Pancreas
+axys_pops_with_sums_panc_with_meta_list <- list(
+  axys_pops_panc_dioxin_meta = axys_pops_panc_dioxin_meta,
+  axys_pops_panc_pcb_meta = axys_pops_panc_pcb_meta,
+  axys_pops_panc_ocp_meta = axys_pops_panc_ocp_meta
+)
+
+# Adipose
+axys_pops_with_sums_adip_with_meta_list <- list(
+  axys_pops_adip_dioxin_meta = axys_pops_adip_dioxin_meta,
+  axys_pops_adip_pcb_meta = axys_pops_adip_pcb_meta,
+  axys_pops_adip_ocp_meta = axys_pops_adip_ocp_meta
+)
+```
+
+```{r}
+# Perform partial correlations
+corr_axys_panc_with_meta_ppc <- map(axys_pops_with_sums_panc_with_meta_list, ~ cor.mtest.partial(
+  df = .x, covariates = c("Age", "BMI"), method = "kendall", adjust = "fdr"
+))
+
+corr_axys_adip_with_meta_ppc <- map(axys_pops_with_sums_adip_with_meta_list, ~ cor.mtest.partial(
+  df = .x, covariates = c("Age", "BMI"), method = "kendall", adjust = "fdr"
+))
+```
+
+## Correlate analyte concentrations with GSIS parameters
+
+### Combine analyte concentrations with GSIS data
+
+```{r}
+# Pancreas dioxins
+axys_pops_panc_dioxin_core <- axys_pops_panc_dioxin_meta %>%
+  left_join(., gsis_adi, by = c("DONOR" = "Donor"))
+
+axys_pops_panc_dioxin_jk_glu <- axys_pops_panc_dioxin_meta %>%
+  left_join(., glu_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_panc_dioxin_jk_leu <- axys_pops_panc_dioxin_meta %>%
+  left_join(., leu_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_panc_dioxin_jk_fa <- axys_pops_panc_dioxin_meta %>%
+  left_join(., fa_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_panc_dioxin_mh_glu <- axys_pops_panc_dioxin_meta %>%
+  left_join(., glu_peri_mh_t, by = c("DONOR" = "Donor")) %>%
+  dplyr::mutate(across(2:ncol(.), as.numeric))
+
+# Pancreas PCBs
+axys_pops_panc_pcb_core <- axys_pops_panc_pcb_meta %>%
+  left_join(., gsis_adi, by = c("DONOR" = "Donor"))
+
+axys_pops_panc_pcb_jk_glu <- axys_pops_panc_pcb_meta %>%
+  left_join(., glu_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_panc_pcb_jk_leu <- axys_pops_panc_pcb_meta %>%
+  left_join(., leu_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_panc_pcb_jk_fa <- axys_pops_panc_pcb_meta %>%
+  left_join(., fa_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_panc_pcb_mh_glu <- axys_pops_panc_pcb_meta %>%
+  left_join(., glu_peri_mh_t, by = c("DONOR" = "Donor")) %>%
+  dplyr::mutate(across(2:ncol(.), as.numeric))
+
+# Pancreas OCPs
+axys_pops_panc_ocp_core <- axys_pops_panc_ocp_meta %>%
+  left_join(., gsis_adi, by = c("DONOR" = "Donor"))
+
+axys_pops_panc_ocp_jk_glu <- axys_pops_panc_ocp_meta %>%
+  left_join(., glu_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_panc_ocp_jk_leu <- axys_pops_panc_ocp_meta %>%
+  left_join(., leu_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_panc_ocp_jk_fa <- axys_pops_panc_ocp_meta %>%
+  left_join(., fa_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_panc_ocp_mh_glu <- axys_pops_panc_ocp_meta %>%
+  left_join(., glu_peri_mh_t, by = c("DONOR" = "Donor")) %>%
+  dplyr::mutate(across(2:ncol(.), as.numeric))
+```
+
+```{r}
+# Adipose dioxins
+axys_pops_adip_dioxin_core <- axys_pops_adip_dioxin_meta %>%
+  left_join(., gsis_adi, by = c("DONOR" = "Donor"))
+
+axys_pops_adip_dioxin_jk_glu <- axys_pops_adip_dioxin_meta %>%
+  left_join(., glu_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_adip_dioxin_jk_leu <- axys_pops_adip_dioxin_meta %>%
+  left_join(., leu_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_adip_dioxin_jk_fa <- axys_pops_adip_dioxin_meta %>%
+  left_join(., fa_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_adip_dioxin_mh_glu <- axys_pops_adip_dioxin_meta %>%
+  left_join(., glu_peri_mh_t, by = c("DONOR" = "Donor")) %>%
+  dplyr::mutate(across(2:ncol(.), as.numeric))
+
+# Adipose PCBs
+axys_pops_adip_pcb_core <- axys_pops_adip_pcb_meta %>%
+  left_join(., gsis_adi, by = c("DONOR" = "Donor"))
+
+axys_pops_adip_pcb_jk_glu <- axys_pops_adip_pcb_meta %>%
+  left_join(., glu_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_adip_pcb_jk_leu <- axys_pops_adip_pcb_meta %>%
+  left_join(., leu_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_adip_pcb_jk_fa <- axys_pops_adip_pcb_meta %>%
+  left_join(., fa_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_adip_pcb_mh_glu <- axys_pops_adip_pcb_meta %>%
+  left_join(., glu_peri_mh_t, by = c("DONOR" = "Donor")) %>%
+  dplyr::mutate(across(2:ncol(.), as.numeric))
+
+# Adipose OCPs
+axys_pops_adip_ocp_core <- axys_pops_adip_ocp_meta %>%
+  left_join(., gsis_adi, by = c("DONOR" = "Donor"))
+
+axys_pops_adip_ocp_jk_glu <- axys_pops_adip_ocp_meta %>%
+  left_join(., glu_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_adip_ocp_jk_leu <- axys_pops_adip_ocp_meta %>%
+  left_join(., leu_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_adip_ocp_jk_fa <- axys_pops_adip_ocp_meta %>%
+  left_join(., fa_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_adip_ocp_mh_glu <- axys_pops_adip_ocp_meta %>%
+  left_join(., glu_peri_mh_t, by = c("DONOR" = "Donor")) %>%
+  dplyr::mutate(across(2:ncol(.), as.numeric))
+```
+
+### Create lists by functional test type
+
+```{r}
+# Pancreas - by GSIS parameter
+axys_pops_panc_core_gsis_list <- list(
+  axys_pops_panc_dioxin_core = axys_pops_panc_dioxin_core,
+  axys_pops_panc_pcb_core = axys_pops_panc_pcb_core,
+  axys_pops_panc_ocp_core = axys_pops_panc_ocp_core
+)
+
+axys_pops_panc_jk_glu_gsis_list <- list(
+  axys_pops_panc_dioxin_jk_glu = axys_pops_panc_dioxin_jk_glu,
+  axys_pops_panc_pcb_jk_glu = axys_pops_panc_pcb_jk_glu,
+  axys_pops_panc_ocp_jk_glu = axys_pops_panc_ocp_jk_glu
+)
+
+axys_pops_panc_jk_leu_gsis_list <- list(
+  axys_pops_panc_dioxin_jk_leu = axys_pops_panc_dioxin_jk_leu,
+  axys_pops_panc_pcb_jk_leu = axys_pops_panc_pcb_jk_leu,
+  axys_pops_panc_ocp_jk_leu = axys_pops_panc_ocp_jk_leu
+)
+
+axys_pops_panc_jk_fa_gsis_list <- list(
+  axys_pops_panc_dioxin_jk_fa = axys_pops_panc_dioxin_jk_fa,
+  axys_pops_panc_pcb_jk_fa = axys_pops_panc_pcb_jk_fa,
+  axys_pops_panc_ocp_jk_fa = axys_pops_panc_ocp_jk_fa
+)
+
+axys_pops_panc_mh_glu_gsis_list <- list(
+  axys_pops_panc_dioxin_mh_glu = axys_pops_panc_dioxin_mh_glu,
+  axys_pops_panc_pcb_mh_glu = axys_pops_panc_pcb_mh_glu,
+  axys_pops_panc_ocp_mh_glu = axys_pops_panc_ocp_mh_glu
+)
+```
+
+```{r}
+# Adipose
+axys_pops_adip_core_gsis_list <- list(
+  axys_pops_adip_dioxin_core = axys_pops_adip_dioxin_core,
+  axys_pops_adip_pcb_core = axys_pops_adip_pcb_core,
+  axys_pops_adip_ocp_core = axys_pops_adip_ocp_core
+)
+
+axys_pops_adip_jk_glu_gsis_list <- list(
+  axys_pops_adip_dioxin_jk_glu = axys_pops_adip_dioxin_jk_glu,
+  axys_pops_adip_pcb_jk_glu = axys_pops_adip_pcb_jk_glu,
+  axys_pops_adip_ocp_jk_glu = axys_pops_adip_ocp_jk_glu
+)
+
+axys_pops_adip_jk_leu_gsis_list <- list(
+  axys_pops_adip_dioxin_jk_leu = axys_pops_adip_dioxin_jk_leu,
+  axys_pops_adip_pcb_jk_leu = axys_pops_adip_pcb_jk_leu,
+  axys_pops_adip_ocp_jk_leu = axys_pops_adip_ocp_jk_leu
+)
+
+axys_pops_adip_jk_fa_gsis_list <- list(
+  axys_pops_adip_dioxin_jk_fa = axys_pops_adip_dioxin_jk_fa,
+  axys_pops_adip_pcb_jk_fa = axys_pops_adip_pcb_jk_fa,
+  axys_pops_adip_ocp_jk_fa = axys_pops_adip_ocp_jk_fa
+)
+
+axys_pops_adip_mh_glu_gsis_list <- list(
+  axys_pops_adip_dioxin_mh_glu = axys_pops_adip_dioxin_mh_glu,
+  axys_pops_adip_pcb_mh_glu = axys_pops_adip_pcb_mh_glu,
+  axys_pops_adip_ocp_mh_glu = axys_pops_adip_ocp_mh_glu
+)
+```
+
+### Perform partial correlations: POPs concentration vs GSIS parameters
+
+```{r}
+# Pancreas POPs concentrations vs ADI Islet Core static GSIS
+corr_axys_panc_core_ppc_null <- map(axys_pops_panc_core_gsis_list, ~ cor.mtest.partial(
+  df = .x, covariates = NULL, method = "kendall", adjust = "fdr"
+))
+
+corr_axys_panc_core_ppc_age <- map(axys_pops_panc_core_gsis_list, ~ cor.mtest.partial(
+  df = .x, covariates = "Age", method = "kendall", adjust = "fdr"
+))
+
+corr_axys_panc_core_ppc_bmi <- map(axys_pops_panc_core_gsis_list, ~ cor.mtest.partial(
+  df = .x, covariates = "BMI", method = "kendall", adjust = "fdr"
+))
+
+corr_axys_panc_core_ppc_age_bmi <- map(axys_pops_panc_core_gsis_list, ~ cor.mtest.partial(
+  df = .x, covariates = c("Age", "BMI"), method = "kendall", adjust = "fdr"
+))
+
+# Pancreas POPs concentrations vs JK glucose perifusion
+corr_axys_panc_jk_glu_ppc_null <- map(axys_pops_panc_jk_glu_gsis_list, ~ cor.mtest.partial(
+  df = .x, covariates = NULL, method = "kendall", adjust = "fdr"
+))
+
+corr_axys_panc_jk_glu_ppc_age <- map(axys_pops_panc_jk_glu_gsis_list, ~ cor.mtest.partial(
+  df = .x, covariates = "Age", method = "kendall", adjust = "fdr"
+))
+
+corr_axys_panc_jk_glu_ppc_bmi <- map(axys_pops_panc_jk_glu_gsis_list, ~ cor.mtest.partial(
+  df = .x, covariates = "BMI", method = "kendall", adjust = "fdr"
+))
+
+corr_axys_panc_jk_glu_ppc_age_bmi <- map(axys_pops_panc_jk_glu_gsis_list, ~ cor.mtest.partial(
+  df = .x, covariates = c("Age", "BMI"), method = "kendall", adjust = "fdr"
+))
+
+# Pancreas POPs concentrations vs JK leu perifusion
+corr_axys_panc_jk_leu_ppc_null <- map(axys_pops_panc_jk_leu_gsis_list, ~ cor.mtest.partial(
+  df = .x, covariates = NULL, method = "kendall", adjust = "fdr"
+))
+
+corr_axys_panc_jk_leu_ppc_age <- map(axys_pops_panc_jk_leu_gsis_list, ~ cor.mtest.partial(
+  df = .x, covariates = "Age", method = "kendall", adjust = "fdr"
+))
+
+corr_axys_panc_jk_leu_ppc_bmi <- map(axys_pops_panc_jk_leu_gsis_list, ~ cor.mtest.partial(
+  df = .x, covariates = "BMI", method = "kendall", adjust = "fdr"
+))
+
+corr_axys_panc_jk_leu_ppc_age_bmi <- map(axys_pops_panc_jk_leu_gsis_list, ~ cor.mtest.partial(
+  df = .x, covariates = c("Age", "BMI"), method = "kendall", adjust = "fdr"
+))
+
+# Pancreas POPs concentrations vs JK fatty acid perifusion
+corr_axys_panc_jk_fa_ppc_null <- map(axys_pops_panc_jk_fa_gsis_list, ~ cor.mtest.partial(
+  df = .x, covariates = NULL, method = "kendall", adjust = "fdr"
+))
+
+corr_axys_panc_jk_fa_ppc_age <- map(axys_pops_panc_jk_fa_gsis_list, ~ cor.mtest.partial(
+  df = .x, covariates = "Age", method = "kendall", adjust = "fdr"
+))
+
+corr_axys_panc_jk_fa_ppc_bmi <- map(axys_pops_panc_jk_fa_gsis_list, ~ cor.mtest.partial(
+  df = .x, covariates = "BMI", method = "kendall", adjust = "fdr"
+))
+
+corr_axys_panc_jk_fa_ppc_age_bmi <- map(axys_pops_panc_jk_fa_gsis_list, ~ cor.mtest.partial(
+  df = .x, covariates = c("Age", "BMI"), method = "kendall", adjust = "fdr"
+))
+
+# Pancreas POPs concentrations vs MH glucose perifusion
+corr_axys_panc_mh_glu_ppc_null <- map(axys_pops_panc_mh_glu_gsis_list, ~ cor.mtest.partial(
+  df = .x, covariates = NULL, method = "kendall", adjust = "fdr"
+))
+
+corr_axys_panc_mh_glu_ppc_age <- map(axys_pops_panc_mh_glu_gsis_list, ~ cor.mtest.partial(
+  df = .x, covariates = "Age", method = "kendall", adjust = "fdr"
+))
+
+corr_axys_panc_mh_glu_ppc_bmi <- map(axys_pops_panc_mh_glu_gsis_list, ~ cor.mtest.partial(
+  df = .x, covariates = "BMI", method = "kendall", adjust = "fdr"
+))
+
+corr_axys_panc_mh_glu_ppc_age_bmi <- map(axys_pops_panc_mh_glu_gsis_list, ~ cor.mtest.partial(
+  df = .x, covariates = c("Age", "BMI"), method = "kendall", adjust = "fdr"
+))
+
+# axys_pops_panc_core_gsis_list
+# axys_pops_panc_jk_glu_gsis_list
+# axys_pops_panc_jk_leu_gsis_list
+# axys_pops_panc_jk_fa_gsis_list
+# axys_pops_panc_mh_glu_gsis_list
+# 
+# axys_pops_adip_core_gsis_list
+# axys_pops_adip_jk_glu_gsis_list
+# axys_pops_adip_jk_leu_gsis_list
+# axys_pops_adip_jk_fa_gsis_list
+# axys_pops_adip_mh_glu_gsis_list
+```
+
+```{r}
+# [PANCREAS] Partial correlation results comparison: dioxins vs ADI IsletCore static GSIS
+corr_axys_panc_dioxin_core_ppc_list <- list(
+  corr_axys_panc_core_ppc_null[["axys_pops_panc_dioxin_core"]][["raw_results"]],
+  corr_axys_panc_core_ppc_age[["axys_pops_panc_dioxin_core"]][["raw_results"]],
+  corr_axys_panc_core_ppc_bmi[["axys_pops_panc_dioxin_core"]][["raw_results"]],
+  corr_axys_panc_core_ppc_age_bmi[["axys_pops_panc_dioxin_core"]][["raw_results"]]
+  )
+
+corr_axys_panc_dioxin_core_ppc_res <- reduce(corr_axys_panc_dioxin_core_ppc_list, left_join, by = c("var1", "var2")) %>%
+  rename_with(~ str_replace_all(., "\\.x\\.x$", "_bmi")) %>%      # Replace .x.x first
+  rename_with(~ str_replace_all(., "\\.y\\.y$", "_age_bmi")) %>% # Replace .y.y next
+  rename_with(~ str_replace_all(., "\\.x$", "_null")) %>%        # Replace .x after
+  rename_with(~ str_replace_all(., "\\.y$", "_age"))
+
+corr_axys_panc_dioxin_core_ppc_res2 <- corr_axys_panc_dioxin_core_ppc_res %>%
+  mutate(estimate_diff_age_null = estimate_age - estimate_null,
+         estimate_diff_bmi_null = estimate_bmi - estimate_null,
+         estimate_diff_agebmi_null = estimate_age_bmi - estimate_null) %>%
+  mutate(across(starts_with("estimate"), ~ round(.x, digits = 3))) %>%
+  relocate(var1, var2, starts_with("estimate"), .before = everything()) %>%
+  dplyr::filter(!str_detect(var1, "IsletCore"), 
+                !str_detect(var1, "Age"), 
+                !str_detect(var1, "BMI"),
+                str_detect(var2, "IsletCore"))
+
+# [PANCREAS] Partial correlation results comparison: PCBs vs ADI IsletCore static GSIS
+corr_axys_panc_pcb_core_ppc_list <- list(
+  corr_axys_panc_core_ppc_null[["axys_pops_panc_pcb_core"]][["raw_results"]],
+  corr_axys_panc_core_ppc_age[["axys_pops_panc_pcb_core"]][["raw_results"]],
+  corr_axys_panc_core_ppc_bmi[["axys_pops_panc_pcb_core"]][["raw_results"]],
+  corr_axys_panc_core_ppc_age_bmi[["axys_pops_panc_pcb_core"]][["raw_results"]]
+  )
+
+corr_axys_panc_pcb_core_ppc_res <- reduce(corr_axys_panc_pcb_core_ppc_list, left_join, by = c("var1", "var2")) %>%
+  rename_with(~ str_replace_all(., "\\.x\\.x$", "_bmi")) %>%      # Replace .x.x first
+  rename_with(~ str_replace_all(., "\\.y\\.y$", "_age_bmi")) %>% # Replace .y.y next
+  rename_with(~ str_replace_all(., "\\.x$", "_null")) %>%        # Replace .x after
+  rename_with(~ str_replace_all(., "\\.y$", "_age"))
+
+corr_axys_panc_pcb_core_ppc_res2 <- corr_axys_panc_pcb_core_ppc_res %>%
+  mutate(estimate_diff_age_null = estimate_age - estimate_null,
+         estimate_diff_bmi_null = estimate_bmi - estimate_null,
+         estimate_diff_agebmi_null = estimate_age_bmi - estimate_null) %>%
+  mutate(across(starts_with("estimate"), ~ round(.x, digits = 3))) %>%
+  relocate(var1, var2, starts_with("estimate"), .before = everything()) %>%
+  dplyr::filter(!str_detect(var1, "IsletCore"), 
+                !str_detect(var1, "Age"), 
+                !str_detect(var1, "BMI"),
+                str_detect(var2, "IsletCore"))
+
+# [PANCREAS] Partial correlation results comparison: OCPs vs ADI IsletCore static GSIS
+corr_axys_panc_ocp_core_ppc_list <- list(
+  corr_axys_panc_core_ppc_null[["axys_pops_panc_ocp_core"]][["raw_results"]],
+  corr_axys_panc_core_ppc_age[["axys_pops_panc_ocp_core"]][["raw_results"]],
+  corr_axys_panc_core_ppc_bmi[["axys_pops_panc_ocp_core"]][["raw_results"]],
+  corr_axys_panc_core_ppc_age_bmi[["axys_pops_panc_ocp_core"]][["raw_results"]]
+  )
+
+corr_axys_panc_ocp_core_ppc_res <- reduce(corr_axys_panc_ocp_core_ppc_list, left_join, by = c("var1", "var2")) %>%
+  rename_with(~ str_replace_all(., "\\.x\\.x$", "_bmi")) %>%      # Replace .x.x first
+  rename_with(~ str_replace_all(., "\\.y\\.y$", "_age_bmi")) %>% # Replace .y.y next
+  rename_with(~ str_replace_all(., "\\.x$", "_null")) %>%        # Replace .x after
+  rename_with(~ str_replace_all(., "\\.y$", "_age"))
+
+corr_axys_panc_ocp_core_ppc_res2 <- corr_axys_panc_ocp_core_ppc_res %>%
+  mutate(estimate_diff_age_null = estimate_age - estimate_null,
+         estimate_diff_bmi_null = estimate_bmi - estimate_null,
+         estimate_diff_agebmi_null = estimate_age_bmi - estimate_null) %>%
+  mutate(across(starts_with("estimate"), ~ round(.x, digits = 3))) %>%
+  relocate(var1, var2, starts_with("estimate"), .before = everything()) %>%
+  dplyr::filter(!str_detect(var1, "IsletCore"), 
+                !str_detect(var1, "Age"), 
+                !str_detect(var1, "BMI"),
+                str_detect(var2, "IsletCore"))
+```
+
+```{r}
+# [PANCREAS] Partial correlation results comparison: dioxins vs JK glucose perifusion
+corr_axys_panc_dioxin_jk_glu_ppc_list <- list(
+  corr_axys_panc_jk_glu_ppc_null[["axys_pops_panc_dioxin_jk_glu"]][["raw_results"]],
+  corr_axys_panc_jk_glu_ppc_age[["axys_pops_panc_dioxin_jk_glu"]][["raw_results"]],
+  corr_axys_panc_jk_glu_ppc_bmi[["axys_pops_panc_dioxin_jk_glu"]][["raw_results"]],
+  corr_axys_panc_jk_glu_ppc_age_bmi[["axys_pops_panc_dioxin_jk_glu"]][["raw_results"]]
+  )
+
+corr_axys_panc_dioxin_jk_glu_ppc_res <- reduce(corr_axys_panc_dioxin_jk_glu_ppc_list, left_join, by = c("var1", "var2")) %>%
+  rename_with(~ str_replace_all(., "\\.x\\.x$", "_bmi")) %>%      # Replace .x.x first
+  rename_with(~ str_replace_all(., "\\.y\\.y$", "_age_bmi")) %>% # Replace .y.y next
+  rename_with(~ str_replace_all(., "\\.x$", "_null")) %>%        # Replace .x after
+  rename_with(~ str_replace_all(., "\\.y$", "_age"))
+
+corr_axys_panc_dioxin_jk_glu_ppc_res2 <- corr_axys_panc_dioxin_jk_glu_ppc_res %>%
+  mutate(estimate_diff_age_null = estimate_age - estimate_null,
+         estimate_diff_bmi_null = estimate_bmi - estimate_null,
+         estimate_diff_agebmi_null = estimate_age_bmi - estimate_null) %>%
+  mutate(across(starts_with("estimate"), ~ round(.x, digits = 3))) %>%
+  relocate(var1, var2, starts_with("estimate"), .before = everything()) %>%
+  dplyr::filter(!str_detect(var1, "JK"), 
+                !str_detect(var1, "Age"), 
+                !str_detect(var1, "BMI"),
+                str_detect(var2, "JK"))
+
+# [PANCREAS] Partial correlation results comparison: PCBs vs JK glucose perifusion
+corr_axys_panc_pcb_jk_glu_ppc_list <- list(
+  corr_axys_panc_jk_glu_ppc_null[["axys_pops_panc_pcb_jk_glu"]][["raw_results"]],
+  corr_axys_panc_jk_glu_ppc_age[["axys_pops_panc_pcb_jk_glu"]][["raw_results"]],
+  corr_axys_panc_jk_glu_ppc_bmi[["axys_pops_panc_pcb_jk_glu"]][["raw_results"]],
+  corr_axys_panc_jk_glu_ppc_age_bmi[["axys_pops_panc_pcb_jk_glu"]][["raw_results"]]
+  )
+
+corr_axys_panc_pcb_jk_glu_ppc_res <- reduce(corr_axys_panc_pcb_jk_glu_ppc_list, left_join, by = c("var1", "var2")) %>%
+  rename_with(~ str_replace_all(., "\\.x\\.x$", "_bmi")) %>%      # Replace .x.x first
+  rename_with(~ str_replace_all(., "\\.y\\.y$", "_age_bmi")) %>% # Replace .y.y next
+  rename_with(~ str_replace_all(., "\\.x$", "_null")) %>%        # Replace .x after
+  rename_with(~ str_replace_all(., "\\.y$", "_age"))
+
+corr_axys_panc_pcb_jk_glu_ppc_res2 <- corr_axys_panc_pcb_jk_glu_ppc_res %>%
+  mutate(estimate_diff_age_null = estimate_age - estimate_null,
+         estimate_diff_bmi_null = estimate_bmi - estimate_null,
+         estimate_diff_agebmi_null = estimate_age_bmi - estimate_null) %>%
+  mutate(across(starts_with("estimate"), ~ round(.x, digits = 3))) %>%
+  relocate(var1, var2, starts_with("estimate"), .before = everything()) %>%
+  dplyr::filter(!str_detect(var1, "JK"), 
+                !str_detect(var1, "Age"), 
+                !str_detect(var1, "BMI"),
+                str_detect(var2, "JK"))
+
+# [PANCREAS] Partial correlation results comparison: OCPs vs JK glucose perifusion
+corr_axys_panc_ocp_jk_glu_ppc_list <- list(
+  corr_axys_panc_jk_glu_ppc_null[["axys_pops_panc_ocp_jk_glu"]][["raw_results"]],
+  corr_axys_panc_jk_glu_ppc_age[["axys_pops_panc_ocp_jk_glu"]][["raw_results"]],
+  corr_axys_panc_jk_glu_ppc_bmi[["axys_pops_panc_ocp_jk_glu"]][["raw_results"]],
+  corr_axys_panc_jk_glu_ppc_age_bmi[["axys_pops_panc_ocp_jk_glu"]][["raw_results"]]
+  )
+
+corr_axys_panc_ocp_jk_glu_ppc_res <- reduce(corr_axys_panc_ocp_jk_glu_ppc_list, left_join, by = c("var1", "var2")) %>%
+  rename_with(~ str_replace_all(., "\\.x\\.x$", "_bmi")) %>%      # Replace .x.x first
+  rename_with(~ str_replace_all(., "\\.y\\.y$", "_age_bmi")) %>% # Replace .y.y next
+  rename_with(~ str_replace_all(., "\\.x$", "_null")) %>%        # Replace .x after
+  rename_with(~ str_replace_all(., "\\.y$", "_age"))
+
+corr_axys_panc_ocp_jk_glu_ppc_res2 <- corr_axys_panc_ocp_jk_glu_ppc_res %>%
+  mutate(estimate_diff_age_null = estimate_age - estimate_null,
+         estimate_diff_bmi_null = estimate_bmi - estimate_null,
+         estimate_diff_agebmi_null = estimate_age_bmi - estimate_null) %>%
+  mutate(across(starts_with("estimate"), ~ round(.x, digits = 3))) %>%
+  relocate(var1, var2, starts_with("estimate"), .before = everything()) %>%
+  dplyr::filter(!str_detect(var1, "JK"), 
+                !str_detect(var1, "Age"), 
+                !str_detect(var1, "BMI"),
+                str_detect(var2, "JK"))
+```
+
+```{r}
+# [PANCREAS] Partial correlation results comparison: dioxins vs JK leucine perifusion
+corr_axys_panc_dioxin_jk_leu_ppc_list <- list(
+  corr_axys_panc_jk_leu_ppc_null[["axys_pops_panc_dioxin_jk_leu"]][["raw_results"]],
+  corr_axys_panc_jk_leu_ppc_age[["axys_pops_panc_dioxin_jk_leu"]][["raw_results"]],
+  corr_axys_panc_jk_leu_ppc_bmi[["axys_pops_panc_dioxin_jk_leu"]][["raw_results"]],
+  corr_axys_panc_jk_leu_ppc_age_bmi[["axys_pops_panc_dioxin_jk_leu"]][["raw_results"]]
+  )
+
+corr_axys_panc_dioxin_jk_leu_ppc_res <- reduce(corr_axys_panc_dioxin_jk_leu_ppc_list, left_join, by = c("var1", "var2")) %>%
+  rename_with(~ str_replace_all(., "\\.x\\.x$", "_bmi")) %>%      # Replace .x.x first
+  rename_with(~ str_replace_all(., "\\.y\\.y$", "_age_bmi")) %>% # Replace .y.y next
+  rename_with(~ str_replace_all(., "\\.x$", "_null")) %>%        # Replace .x after
+  rename_with(~ str_replace_all(., "\\.y$", "_age"))
+
+corr_axys_panc_dioxin_jk_leu_ppc_res2 <- corr_axys_panc_dioxin_jk_leu_ppc_res %>%
+  mutate(estimate_diff_age_null = estimate_age - estimate_null,
+         estimate_diff_bmi_null = estimate_bmi - estimate_null,
+         estimate_diff_agebmi_null = estimate_age_bmi - estimate_null) %>%
+  mutate(across(starts_with("estimate"), ~ round(.x, digits = 3))) %>%
+  relocate(var1, var2, starts_with("estimate"), .before = everything()) %>%
+  dplyr::filter(!str_detect(var1, "JK"), 
+                !str_detect(var1, "Age"), 
+                !str_detect(var1, "BMI"),
+                str_detect(var2, "JK"))
+
+# [PANCREAS] Partial correlation results comparison: PCBs vs JK leucine perifusion
+corr_axys_panc_pcb_jk_leu_ppc_list <- list(
+  corr_axys_panc_jk_leu_ppc_null[["axys_pops_panc_pcb_jk_leu"]][["raw_results"]],
+  corr_axys_panc_jk_leu_ppc_age[["axys_pops_panc_pcb_jk_leu"]][["raw_results"]],
+  corr_axys_panc_jk_leu_ppc_bmi[["axys_pops_panc_pcb_jk_leu"]][["raw_results"]],
+  corr_axys_panc_jk_leu_ppc_age_bmi[["axys_pops_panc_pcb_jk_leu"]][["raw_results"]]
+  )
+
+corr_axys_panc_pcb_jk_leu_ppc_res <- reduce(corr_axys_panc_pcb_jk_leu_ppc_list, left_join, by = c("var1", "var2")) %>%
+  rename_with(~ str_replace_all(., "\\.x\\.x$", "_bmi")) %>%      # Replace .x.x first
+  rename_with(~ str_replace_all(., "\\.y\\.y$", "_age_bmi")) %>% # Replace .y.y next
+  rename_with(~ str_replace_all(., "\\.x$", "_null")) %>%        # Replace .x after
+  rename_with(~ str_replace_all(., "\\.y$", "_age"))
+
+corr_axys_panc_pcb_jk_leu_ppc_res2 <- corr_axys_panc_pcb_jk_leu_ppc_res %>%
+  mutate(estimate_diff_age_null = estimate_age - estimate_null,
+         estimate_diff_bmi_null = estimate_bmi - estimate_null,
+         estimate_diff_agebmi_null = estimate_age_bmi - estimate_null) %>%
+  mutate(across(starts_with("estimate"), ~ round(.x, digits = 3))) %>%
+  relocate(var1, var2, starts_with("estimate"), .before = everything()) %>%
+  dplyr::filter(!str_detect(var1, "JK"), 
+                !str_detect(var1, "Age"), 
+                !str_detect(var1, "BMI"),
+                str_detect(var2, "JK"))
+
+# [PANCREAS] Partial correlation results comparison: OCPs vs JK leucine perifusion
+corr_axys_panc_ocp_jk_leu_ppc_list <- list(
+  corr_axys_panc_jk_leu_ppc_null[["axys_pops_panc_ocp_jk_leu"]][["raw_results"]],
+  corr_axys_panc_jk_leu_ppc_age[["axys_pops_panc_ocp_jk_leu"]][["raw_results"]],
+  corr_axys_panc_jk_leu_ppc_bmi[["axys_pops_panc_ocp_jk_leu"]][["raw_results"]],
+  corr_axys_panc_jk_leu_ppc_age_bmi[["axys_pops_panc_ocp_jk_leu"]][["raw_results"]]
+  )
+
+corr_axys_panc_ocp_jk_leu_ppc_res <- reduce(corr_axys_panc_ocp_jk_leu_ppc_list, left_join, by = c("var1", "var2")) %>%
+  rename_with(~ str_replace_all(., "\\.x\\.x$", "_bmi")) %>%      # Replace .x.x first
+  rename_with(~ str_replace_all(., "\\.y\\.y$", "_age_bmi")) %>% # Replace .y.y next
+  rename_with(~ str_replace_all(., "\\.x$", "_null")) %>%        # Replace .x after
+  rename_with(~ str_replace_all(., "\\.y$", "_age"))
+
+corr_axys_panc_ocp_jk_leu_ppc_res2 <- corr_axys_panc_ocp_jk_leu_ppc_res %>%
+  mutate(estimate_diff_age_null = estimate_age - estimate_null,
+         estimate_diff_bmi_null = estimate_bmi - estimate_null,
+         estimate_diff_agebmi_null = estimate_age_bmi - estimate_null) %>%
+  mutate(across(starts_with("estimate"), ~ round(.x, digits = 3))) %>%
+  relocate(var1, var2, starts_with("estimate"), .before = everything()) %>%
+  dplyr::filter(!str_detect(var1, "JK"), 
+                !str_detect(var1, "Age"), 
+                !str_detect(var1, "BMI"),
+                str_detect(var2, "JK"))
+```
+
+```{r}
+# [PANCREAS] Partial correlation results comparison: dioxins vs JK fatty acid perifusion
+corr_axys_panc_dioxin_jk_fa_ppc_list <- list(
+  corr_axys_panc_jk_fa_ppc_null[["axys_pops_panc_dioxin_jk_fa"]][["raw_results"]],
+  corr_axys_panc_jk_fa_ppc_age[["axys_pops_panc_dioxin_jk_fa"]][["raw_results"]],
+  corr_axys_panc_jk_fa_ppc_bmi[["axys_pops_panc_dioxin_jk_fa"]][["raw_results"]],
+  corr_axys_panc_jk_fa_ppc_age_bmi[["axys_pops_panc_dioxin_jk_fa"]][["raw_results"]]
+  )
+
+corr_axys_panc_dioxin_jk_fa_ppc_res <- reduce(corr_axys_panc_dioxin_jk_fa_ppc_list, left_join, by = c("var1", "var2")) %>%
+  rename_with(~ str_replace_all(., "\\.x\\.x$", "_bmi")) %>%      # Replace .x.x first
+  rename_with(~ str_replace_all(., "\\.y\\.y$", "_age_bmi")) %>% # Replace .y.y next
+  rename_with(~ str_replace_all(., "\\.x$", "_null")) %>%        # Replace .x after
+  rename_with(~ str_replace_all(., "\\.y$", "_age"))
+
+corr_axys_panc_dioxin_jk_fa_ppc_res2 <- corr_axys_panc_dioxin_jk_fa_ppc_res %>%
+  mutate(estimate_diff_age_null = estimate_age - estimate_null,
+         estimate_diff_bmi_null = estimate_bmi - estimate_null,
+         estimate_diff_agebmi_null = estimate_age_bmi - estimate_null) %>%
+  mutate(across(starts_with("estimate"), ~ round(.x, digits = 3))) %>%
+  relocate(var1, var2, starts_with("estimate"), .before = everything()) %>%
+  dplyr::filter(!str_detect(var1, "JK"), 
+                !str_detect(var1, "Age"), 
+                !str_detect(var1, "BMI"),
+                str_detect(var2, "JK"))
+
+# [PANCREAS] Partial correlation results comparison: PCBs vs JK fatty acid perifusion
+corr_axys_panc_pcb_jk_fa_ppc_list <- list(
+  corr_axys_panc_jk_fa_ppc_null[["axys_pops_panc_pcb_jk_fa"]][["raw_results"]],
+  corr_axys_panc_jk_fa_ppc_age[["axys_pops_panc_pcb_jk_fa"]][["raw_results"]],
+  corr_axys_panc_jk_fa_ppc_bmi[["axys_pops_panc_pcb_jk_fa"]][["raw_results"]],
+  corr_axys_panc_jk_fa_ppc_age_bmi[["axys_pops_panc_pcb_jk_fa"]][["raw_results"]]
+  )
+
+corr_axys_panc_pcb_jk_fa_ppc_res <- reduce(corr_axys_panc_pcb_jk_fa_ppc_list, left_join, by = c("var1", "var2")) %>%
+  rename_with(~ str_replace_all(., "\\.x\\.x$", "_bmi")) %>%      # Replace .x.x first
+  rename_with(~ str_replace_all(., "\\.y\\.y$", "_age_bmi")) %>% # Replace .y.y next
+  rename_with(~ str_replace_all(., "\\.x$", "_null")) %>%        # Replace .x after
+  rename_with(~ str_replace_all(., "\\.y$", "_age"))
+
+corr_axys_panc_pcb_jk_fa_ppc_res2 <- corr_axys_panc_pcb_jk_fa_ppc_res %>%
+  mutate(estimate_diff_age_null = estimate_age - estimate_null,
+         estimate_diff_bmi_null = estimate_bmi - estimate_null,
+         estimate_diff_agebmi_null = estimate_age_bmi - estimate_null) %>%
+  mutate(across(starts_with("estimate"), ~ round(.x, digits = 3))) %>%
+  relocate(var1, var2, starts_with("estimate"), .before = everything()) %>%
+  dplyr::filter(!str_detect(var1, "JK"), 
+                !str_detect(var1, "Age"), 
+                !str_detect(var1, "BMI"),
+                str_detect(var2, "JK"))
+
+# [PANCREAS] Partial correlation results comparison: OCPs vs JK fatty acid perifusion
+corr_axys_panc_ocp_jk_fa_ppc_list <- list(
+  corr_axys_panc_jk_fa_ppc_null[["axys_pops_panc_ocp_jk_fa"]][["raw_results"]],
+  corr_axys_panc_jk_fa_ppc_age[["axys_pops_panc_ocp_jk_fa"]][["raw_results"]],
+  corr_axys_panc_jk_fa_ppc_bmi[["axys_pops_panc_ocp_jk_fa"]][["raw_results"]],
+  corr_axys_panc_jk_fa_ppc_age_bmi[["axys_pops_panc_ocp_jk_fa"]][["raw_results"]]
+  )
+
+corr_axys_panc_ocp_jk_fa_ppc_res <- reduce(corr_axys_panc_ocp_jk_fa_ppc_list, left_join, by = c("var1", "var2")) %>%
+  rename_with(~ str_replace_all(., "\\.x\\.x$", "_bmi")) %>%      # Replace .x.x first
+  rename_with(~ str_replace_all(., "\\.y\\.y$", "_age_bmi")) %>% # Replace .y.y next
+  rename_with(~ str_replace_all(., "\\.x$", "_null")) %>%        # Replace .x after
+  rename_with(~ str_replace_all(., "\\.y$", "_age"))
+
+corr_axys_panc_ocp_jk_fa_ppc_res2 <- corr_axys_panc_ocp_jk_fa_ppc_res %>%
+  mutate(estimate_diff_age_null = estimate_age - estimate_null,
+         estimate_diff_bmi_null = estimate_bmi - estimate_null,
+         estimate_diff_agebmi_null = estimate_age_bmi - estimate_null) %>%
+  mutate(across(starts_with("estimate"), ~ round(.x, digits = 3))) %>%
+  relocate(var1, var2, starts_with("estimate"), .before = everything()) %>%
+  dplyr::filter(!str_detect(var1, "JK"), 
+                !str_detect(var1, "Age"), 
+                !str_detect(var1, "BMI"),
+                str_detect(var2, "JK"))
+```
+
+```{r}
+# [PANCREAS] Partial correlation results comparison: dioxin vs MH glucose perifusion
+corr_axys_panc_dioxin_mh_glu_ppc_list <- list(
+  corr_axys_panc_mh_glu_ppc_null[["axys_pops_panc_dioxin_mh_glu"]][["raw_results"]],
+  corr_axys_panc_mh_glu_ppc_age[["axys_pops_panc_dioxin_mh_glu"]][["raw_results"]],
+  corr_axys_panc_mh_glu_ppc_bmi[["axys_pops_panc_dioxin_mh_glu"]][["raw_results"]],
+  corr_axys_panc_mh_glu_ppc_age_bmi[["axys_pops_panc_dioxin_mh_glu"]][["raw_results"]]
+  )
+
+corr_axys_panc_dioxin_mh_glu_ppc_res <- reduce(corr_axys_panc_dioxin_mh_glu_ppc_list, left_join, by = c("var1", "var2")) %>%
+  rename_with(~ str_replace_all(., "\\.x\\.x$", "_bmi")) %>%      # Replace .x.x first
+  rename_with(~ str_replace_all(., "\\.y\\.y$", "_age_bmi")) %>% # Replace .y.y next
+  rename_with(~ str_replace_all(., "\\.x$", "_null")) %>%        # Replace .x after
+  rename_with(~ str_replace_all(., "\\.y$", "_age"))
+
+corr_axys_panc_dioxin_mh_glu_ppc_res2 <- corr_axys_panc_dioxin_mh_glu_ppc_res %>%
+  mutate(estimate_diff_age_null = estimate_age - estimate_null,
+         estimate_diff_bmi_null = estimate_bmi - estimate_null,
+         estimate_diff_agebmi_null = estimate_age_bmi - estimate_null) %>%
+  mutate(across(starts_with("estimate"), ~ round(.x, digits = 3))) %>%
+  relocate(var1, var2, starts_with("estimate"), .before = everything()) %>%
+  dplyr::filter(!str_detect(var1, "MH"), 
+                !str_detect(var1, "Age"), 
+                !str_detect(var1, "BMI"),
+                str_detect(var2, "MH"))
+
+# [PANCREAS] Partial correlation results comparison: PCBs vs MH glucose perifusion
+corr_axys_panc_pcb_mh_glu_ppc_list <- list(
+  corr_axys_panc_mh_glu_ppc_null[["axys_pops_panc_pcb_mh_glu"]][["raw_results"]],
+  corr_axys_panc_mh_glu_ppc_age[["axys_pops_panc_pcb_mh_glu"]][["raw_results"]],
+  corr_axys_panc_mh_glu_ppc_bmi[["axys_pops_panc_pcb_mh_glu"]][["raw_results"]],
+  corr_axys_panc_mh_glu_ppc_age_bmi[["axys_pops_panc_pcb_mh_glu"]][["raw_results"]]
+  )
+
+corr_axys_panc_pcb_mh_glu_ppc_res <- reduce(corr_axys_panc_pcb_mh_glu_ppc_list, left_join, by = c("var1", "var2")) %>%
+  rename_with(~ str_replace_all(., "\\.x\\.x$", "_bmi")) %>%      # Replace .x.x first
+  rename_with(~ str_replace_all(., "\\.y\\.y$", "_age_bmi")) %>% # Replace .y.y next
+  rename_with(~ str_replace_all(., "\\.x$", "_null")) %>%        # Replace .x after
+  rename_with(~ str_replace_all(., "\\.y$", "_age"))
+
+corr_axys_panc_pcb_mh_glu_ppc_res2 <- corr_axys_panc_pcb_mh_glu_ppc_res %>%
+  mutate(estimate_diff_age_null = estimate_age - estimate_null,
+         estimate_diff_bmi_null = estimate_bmi - estimate_null,
+         estimate_diff_agebmi_null = estimate_age_bmi - estimate_null) %>%
+  mutate(across(starts_with("estimate"), ~ round(.x, digits = 3))) %>%
+  relocate(var1, var2, starts_with("estimate"), .before = everything()) %>%
+  dplyr::filter(!str_detect(var1, "MH"), 
+                !str_detect(var1, "Age"), 
+                !str_detect(var1, "BMI"),
+                str_detect(var2, "MH"))
+
+# [PANCREAS] Partial correlation results comparison: OCPs vs MH glucose perifusion
+corr_axys_panc_ocp_mh_glu_ppc_list <- list(
+  corr_axys_panc_mh_glu_ppc_null[["axys_pops_panc_ocp_mh_glu"]][["raw_results"]],
+  corr_axys_panc_mh_glu_ppc_age[["axys_pops_panc_ocp_mh_glu"]][["raw_results"]],
+  corr_axys_panc_mh_glu_ppc_bmi[["axys_pops_panc_ocp_mh_glu"]][["raw_results"]],
+  corr_axys_panc_mh_glu_ppc_age_bmi[["axys_pops_panc_ocp_mh_glu"]][["raw_results"]]
+  )
+
+corr_axys_panc_ocp_mh_glu_ppc_res <- reduce(corr_axys_panc_ocp_mh_glu_ppc_list, left_join, by = c("var1", "var2")) %>%
+  rename_with(~ str_replace_all(., "\\.x\\.x$", "_bmi")) %>%      # Replace .x.x first
+  rename_with(~ str_replace_all(., "\\.y\\.y$", "_age_bmi")) %>% # Replace .y.y next
+  rename_with(~ str_replace_all(., "\\.x$", "_null")) %>%        # Replace .x after
+  rename_with(~ str_replace_all(., "\\.y$", "_age"))
+
+corr_axys_panc_ocp_mh_glu_ppc_res2 <- corr_axys_panc_ocp_mh_glu_ppc_res %>%
+  mutate(estimate_diff_age_null = estimate_age - estimate_null,
+         estimate_diff_bmi_null = estimate_bmi - estimate_null,
+         estimate_diff_agebmi_null = estimate_age_bmi - estimate_null) %>%
+  mutate(across(starts_with("estimate"), ~ round(.x, digits = 3))) %>%
+  relocate(var1, var2, starts_with("estimate"), .before = everything()) %>%
+  dplyr::filter(!str_detect(var1, "MH"), 
+                !str_detect(var1, "Age"), 
+                !str_detect(var1, "BMI"),
+                str_detect(var2, "MH"))
+```
+
+```{r}
+# Adipose POPs concentrations vs ADI Islet Core static GSIS
+corr_axys_adip_core_ppc_null <- map(axys_pops_adip_core_gsis_list, ~ cor.mtest.partial(
+  df = .x, covariates = NULL, method = "kendall", adjust = "fdr"
+))
+
+corr_axys_adip_core_ppc_age <- map(axys_pops_adip_core_gsis_list, ~ cor.mtest.partial(
+  df = .x, covariates = "Age", method = "kendall", adjust = "fdr"
+))
+
+corr_axys_adip_core_ppc_bmi <- map(axys_pops_adip_core_gsis_list, ~ cor.mtest.partial(
+  df = .x, covariates = "BMI", method = "kendall", adjust = "fdr"
+))
+
+corr_axys_adip_core_ppc_age_bmi <- map(axys_pops_adip_core_gsis_list, ~ cor.mtest.partial(
+  df = .x, covariates = c("Age", "BMI"), method = "kendall", adjust = "fdr"
+))
+
+# Adipose POPs concentrations vs JK glucose perifusion
+corr_axys_adip_jk_glu_ppc_null <- map(axys_pops_adip_jk_glu_gsis_list, ~ cor.mtest.partial(
+  df = .x, covariates = NULL, method = "kendall", adjust = "fdr"
+))
+
+corr_axys_adip_jk_glu_ppc_age <- map(axys_pops_adip_jk_glu_gsis_list, ~ cor.mtest.partial(
+  df = .x, covariates = "Age", method = "kendall", adjust = "fdr"
+))
+
+corr_axys_adip_jk_glu_ppc_bmi <- map(axys_pops_adip_jk_glu_gsis_list, ~ cor.mtest.partial(
+  df = .x, covariates = "BMI", method = "kendall", adjust = "fdr"
+))
+
+corr_axys_adip_jk_glu_ppc_age_bmi <- map(axys_pops_adip_jk_glu_gsis_list, ~ cor.mtest.partial(
+  df = .x, covariates = c("Age", "BMI"), method = "kendall", adjust = "fdr"
+))
+
+# Adipose POPs concentrations vs JK leu perifusion
+corr_axys_adip_jk_leu_ppc_null <- map(axys_pops_adip_jk_leu_gsis_list, ~ cor.mtest.partial(
+  df = .x, covariates = NULL, method = "kendall", adjust = "fdr"
+))
+
+corr_axys_adip_jk_leu_ppc_age <- map(axys_pops_adip_jk_leu_gsis_list, ~ cor.mtest.partial(
+  df = .x, covariates = "Age", method = "kendall", adjust = "fdr"
+))
+
+corr_axys_adip_jk_leu_ppc_bmi <- map(axys_pops_adip_jk_leu_gsis_list, ~ cor.mtest.partial(
+  df = .x, covariates = "BMI", method = "kendall", adjust = "fdr"
+))
+
+corr_axys_adip_jk_leu_ppc_age_bmi <- map(axys_pops_adip_jk_leu_gsis_list, ~ cor.mtest.partial(
+  df = .x, covariates = c("Age", "BMI"), method = "kendall", adjust = "fdr"
+))
+
+# Adipose POPs concentrations vs JK fatty acid perifusion
+corr_axys_adip_jk_fa_ppc_null <- map(axys_pops_adip_jk_fa_gsis_list, ~ cor.mtest.partial(
+  df = .x, covariates = NULL, method = "kendall", adjust = "fdr"
+))
+
+corr_axys_adip_jk_fa_ppc_age <- map(axys_pops_adip_jk_fa_gsis_list, ~ cor.mtest.partial(
+  df = .x, covariates = "Age", method = "kendall", adjust = "fdr"
+))
+
+corr_axys_adip_jk_fa_ppc_bmi <- map(axys_pops_adip_jk_fa_gsis_list, ~ cor.mtest.partial(
+  df = .x, covariates = "BMI", method = "kendall", adjust = "fdr"
+))
+
+corr_axys_adip_jk_fa_ppc_age_bmi <- map(axys_pops_adip_jk_fa_gsis_list, ~ cor.mtest.partial(
+  df = .x, covariates = c("Age", "BMI"), method = "kendall", adjust = "fdr"
+))
+
+# Adipose POPs concentrations vs MH glucose perifusion
+corr_axys_adip_mh_glu_ppc_null <- map(axys_pops_adip_mh_glu_gsis_list, ~ cor.mtest.partial(
+  df = .x, covariates = NULL, method = "kendall", adjust = "fdr"
+))
+
+corr_axys_adip_mh_glu_ppc_age_bmi <- map(axys_pops_adip_mh_glu_gsis_list, ~ cor.mtest.partial(
+  df = .x, covariates = c("Age", "BMI"), method = "kendall", adjust = "fdr"
+))
+
+corr_axys_adip_mh_glu_ppc_age <- map(axys_pops_adip_mh_glu_gsis_list, ~ cor.mtest.partial(
+  df = .x, covariates = "Age", method = "kendall", adjust = "fdr"
+))
+
+corr_axys_adip_mh_glu_ppc_bmi <- map(axys_pops_adip_mh_glu_gsis_list, ~ cor.mtest.partial(
+  df = .x, covariates = "BMI", method = "kendall", adjust = "fdr"
+))
+```
+
+```{r}
+# [ADIPOSE] Partial correlation results comparison: dioxins vs ADI IsletCore static GSIS
+corr_axys_adip_dioxin_core_ppc_list <- list(
+  corr_axys_adip_core_ppc_null[["axys_pops_adip_dioxin_core"]][["raw_results"]],
+  corr_axys_adip_core_ppc_age[["axys_pops_adip_dioxin_core"]][["raw_results"]],
+  corr_axys_adip_core_ppc_bmi[["axys_pops_adip_dioxin_core"]][["raw_results"]],
+  corr_axys_adip_core_ppc_age_bmi[["axys_pops_adip_dioxin_core"]][["raw_results"]]
+  )
+
+corr_axys_adip_dioxin_core_ppc_res <- reduce(corr_axys_adip_dioxin_core_ppc_list, left_join, by = c("var1", "var2")) %>%
+  rename_with(~ str_replace_all(., "\\.x\\.x$", "_bmi")) %>%      # Replace .x.x first
+  rename_with(~ str_replace_all(., "\\.y\\.y$", "_age_bmi")) %>% # Replace .y.y next
+  rename_with(~ str_replace_all(., "\\.x$", "_null")) %>%        # Replace .x after
+  rename_with(~ str_replace_all(., "\\.y$", "_age"))
+
+corr_axys_adip_dioxin_core_ppc_res2 <- corr_axys_adip_dioxin_core_ppc_res %>%
+  mutate(estimate_diff_age_null = estimate_age - estimate_null,
+         estimate_diff_bmi_null = estimate_bmi - estimate_null,
+         estimate_diff_agebmi_null = estimate_age_bmi - estimate_null) %>%
+  mutate(across(starts_with("estimate"), ~ round(.x, digits = 3))) %>%
+  relocate(var1, var2, starts_with("estimate"), .before = everything()) %>%
+  dplyr::filter(!str_detect(var1, "IsletCore"), 
+                !str_detect(var1, "Age"), 
+                !str_detect(var1, "BMI"),
+                str_detect(var2, "IsletCore"))
+
+# [ADIPOSE] Partial correlation results comparison: PCBs vs ADI IsletCore static GSIS
+corr_axys_adip_pcb_core_ppc_list <- list(
+  corr_axys_adip_core_ppc_null[["axys_pops_adip_pcb_core"]][["raw_results"]],
+  corr_axys_adip_core_ppc_age[["axys_pops_adip_pcb_core"]][["raw_results"]],
+  corr_axys_adip_core_ppc_bmi[["axys_pops_adip_pcb_core"]][["raw_results"]],
+  corr_axys_adip_core_ppc_age_bmi[["axys_pops_adip_pcb_core"]][["raw_results"]]
+  )
+
+corr_axys_adip_pcb_core_ppc_res <- reduce(corr_axys_adip_pcb_core_ppc_list, left_join, by = c("var1", "var2")) %>%
+  rename_with(~ str_replace_all(., "\\.x\\.x$", "_bmi")) %>%      # Replace .x.x first
+  rename_with(~ str_replace_all(., "\\.y\\.y$", "_age_bmi")) %>% # Replace .y.y next
+  rename_with(~ str_replace_all(., "\\.x$", "_null")) %>%        # Replace .x after
+  rename_with(~ str_replace_all(., "\\.y$", "_age"))
+
+corr_axys_adip_pcb_core_ppc_res2 <- corr_axys_adip_pcb_core_ppc_res %>%
+  mutate(estimate_diff_age_null = estimate_age - estimate_null,
+         estimate_diff_bmi_null = estimate_bmi - estimate_null,
+         estimate_diff_agebmi_null = estimate_age_bmi - estimate_null) %>%
+  mutate(across(starts_with("estimate"), ~ round(.x, digits = 3))) %>%
+  relocate(var1, var2, starts_with("estimate"), .before = everything()) %>%
+  dplyr::filter(!str_detect(var1, "IsletCore"), 
+                !str_detect(var1, "Age"), 
+                !str_detect(var1, "BMI"),
+                str_detect(var2, "IsletCore"))
+
+# [ADIPOSE] Partial correlation results comparison: OCPs vs ADI IsletCore static GSIS
+corr_axys_adip_ocp_core_ppc_list <- list(
+  corr_axys_adip_core_ppc_null[["axys_pops_adip_ocp_core"]][["raw_results"]],
+  corr_axys_adip_core_ppc_age[["axys_pops_adip_ocp_core"]][["raw_results"]],
+  corr_axys_adip_core_ppc_bmi[["axys_pops_adip_ocp_core"]][["raw_results"]],
+  corr_axys_adip_core_ppc_age_bmi[["axys_pops_adip_ocp_core"]][["raw_results"]]
+  )
+
+corr_axys_adip_ocp_core_ppc_res <- reduce(corr_axys_adip_ocp_core_ppc_list, left_join, by = c("var1", "var2")) %>%
+  rename_with(~ str_replace_all(., "\\.x\\.x$", "_bmi")) %>%      # Replace .x.x first
+  rename_with(~ str_replace_all(., "\\.y\\.y$", "_age_bmi")) %>% # Replace .y.y next
+  rename_with(~ str_replace_all(., "\\.x$", "_null")) %>%        # Replace .x after
+  rename_with(~ str_replace_all(., "\\.y$", "_age"))
+
+corr_axys_adip_ocp_core_ppc_res2 <- corr_axys_adip_ocp_core_ppc_res %>%
+  mutate(estimate_diff_age_null = estimate_age - estimate_null,
+         estimate_diff_bmi_null = estimate_bmi - estimate_null,
+         estimate_diff_agebmi_null = estimate_age_bmi - estimate_null) %>%
+  mutate(across(starts_with("estimate"), ~ round(.x, digits = 3))) %>%
+  relocate(var1, var2, starts_with("estimate"), .before = everything()) %>%
+  dplyr::filter(!str_detect(var1, "IsletCore"), 
+                !str_detect(var1, "Age"), 
+                !str_detect(var1, "BMI"),
+                str_detect(var2, "IsletCore"))
+```
+
+```{r}
+# [ADIPOSE] Partial correlation results comparison: dioxins vs JK glucose perifusion
+corr_axys_adip_dioxin_jk_glu_ppc_list <- list(
+  corr_axys_adip_jk_glu_ppc_null[["axys_pops_adip_dioxin_jk_glu"]][["raw_results"]],
+  corr_axys_adip_jk_glu_ppc_age[["axys_pops_adip_dioxin_jk_glu"]][["raw_results"]],
+  corr_axys_adip_jk_glu_ppc_bmi[["axys_pops_adip_dioxin_jk_glu"]][["raw_results"]],
+  corr_axys_adip_jk_glu_ppc_age_bmi[["axys_pops_adip_dioxin_jk_glu"]][["raw_results"]]
+  )
+
+corr_axys_adip_dioxin_jk_glu_ppc_res <- reduce(corr_axys_adip_dioxin_jk_glu_ppc_list, left_join, by = c("var1", "var2")) %>%
+  rename_with(~ str_replace_all(., "\\.x\\.x$", "_bmi")) %>%      # Replace .x.x first
+  rename_with(~ str_replace_all(., "\\.y\\.y$", "_age_bmi")) %>% # Replace .y.y next
+  rename_with(~ str_replace_all(., "\\.x$", "_null")) %>%        # Replace .x after
+  rename_with(~ str_replace_all(., "\\.y$", "_age"))
+
+corr_axys_adip_dioxin_jk_glu_ppc_res2 <- corr_axys_adip_dioxin_jk_glu_ppc_res %>%
+  mutate(estimate_diff_age_null = estimate_age - estimate_null,
+         estimate_diff_bmi_null = estimate_bmi - estimate_null,
+         estimate_diff_agebmi_null = estimate_age_bmi - estimate_null) %>%
+  mutate(across(starts_with("estimate"), ~ round(.x, digits = 3))) %>%
+  relocate(var1, var2, starts_with("estimate"), .before = everything()) %>%
+  dplyr::filter(!str_detect(var1, "JK"), 
+                !str_detect(var1, "Age"), 
+                !str_detect(var1, "BMI"),
+                str_detect(var2, "JK"))
+
+# [ADIPOSE] Partial correlation results comparison: PCBs vs JK glucose perifusion
+corr_axys_adip_pcb_jk_glu_ppc_list <- list(
+  corr_axys_adip_jk_glu_ppc_null[["axys_pops_adip_pcb_jk_glu"]][["raw_results"]],
+  corr_axys_adip_jk_glu_ppc_age[["axys_pops_adip_pcb_jk_glu"]][["raw_results"]],
+  corr_axys_adip_jk_glu_ppc_bmi[["axys_pops_adip_pcb_jk_glu"]][["raw_results"]],
+  corr_axys_adip_jk_glu_ppc_age_bmi[["axys_pops_adip_pcb_jk_glu"]][["raw_results"]]
+  )
+
+corr_axys_adip_pcb_jk_glu_ppc_res <- reduce(corr_axys_adip_pcb_jk_glu_ppc_list, left_join, by = c("var1", "var2")) %>%
+  rename_with(~ str_replace_all(., "\\.x\\.x$", "_bmi")) %>%      # Replace .x.x first
+  rename_with(~ str_replace_all(., "\\.y\\.y$", "_age_bmi")) %>% # Replace .y.y next
+  rename_with(~ str_replace_all(., "\\.x$", "_null")) %>%        # Replace .x after
+  rename_with(~ str_replace_all(., "\\.y$", "_age"))
+
+corr_axys_adip_pcb_jk_glu_ppc_res2 <- corr_axys_adip_pcb_jk_glu_ppc_res %>%
+  mutate(estimate_diff_age_null = estimate_age - estimate_null,
+         estimate_diff_bmi_null = estimate_bmi - estimate_null,
+         estimate_diff_agebmi_null = estimate_age_bmi - estimate_null) %>%
+  mutate(across(starts_with("estimate"), ~ round(.x, digits = 3))) %>%
+  relocate(var1, var2, starts_with("estimate"), .before = everything()) %>%
+  dplyr::filter(!str_detect(var1, "JK"), 
+                !str_detect(var1, "Age"), 
+                !str_detect(var1, "BMI"),
+                str_detect(var2, "JK"))
+
+# [ADIPOSE] Partial correlation results comparison: OCPs vs JK glucose perifusion
+corr_axys_adip_ocp_jk_glu_ppc_list <- list(
+  corr_axys_adip_jk_glu_ppc_null[["axys_pops_adip_ocp_jk_glu"]][["raw_results"]],
+  corr_axys_adip_jk_glu_ppc_age[["axys_pops_adip_ocp_jk_glu"]][["raw_results"]],
+  corr_axys_adip_jk_glu_ppc_bmi[["axys_pops_adip_ocp_jk_glu"]][["raw_results"]],
+  corr_axys_adip_jk_glu_ppc_age_bmi[["axys_pops_adip_ocp_jk_glu"]][["raw_results"]]
+  )
+
+corr_axys_adip_ocp_jk_glu_ppc_res <- reduce(corr_axys_adip_ocp_jk_glu_ppc_list, left_join, by = c("var1", "var2")) %>%
+  rename_with(~ str_replace_all(., "\\.x\\.x$", "_bmi")) %>%      # Replace .x.x first
+  rename_with(~ str_replace_all(., "\\.y\\.y$", "_age_bmi")) %>% # Replace .y.y next
+  rename_with(~ str_replace_all(., "\\.x$", "_null")) %>%        # Replace .x after
+  rename_with(~ str_replace_all(., "\\.y$", "_age"))
+
+corr_axys_adip_ocp_jk_glu_ppc_res2 <- corr_axys_adip_ocp_jk_glu_ppc_res %>%
+  mutate(estimate_diff_age_null = estimate_age - estimate_null,
+         estimate_diff_bmi_null = estimate_bmi - estimate_null,
+         estimate_diff_agebmi_null = estimate_age_bmi - estimate_null) %>%
+  mutate(across(starts_with("estimate"), ~ round(.x, digits = 3))) %>%
+  relocate(var1, var2, starts_with("estimate"), .before = everything()) %>%
+  dplyr::filter(!str_detect(var1, "JK"), 
+                !str_detect(var1, "Age"), 
+                !str_detect(var1, "BMI"),
+                str_detect(var2, "JK"))
+```
+
+```{r}
+# [ADIPOSE] Partial correlation results comparison: dioxins vs JK leucine perifusion
+corr_axys_adip_dioxin_jk_leu_ppc_list <- list(
+  corr_axys_adip_jk_leu_ppc_null[["axys_pops_adip_dioxin_jk_leu"]][["raw_results"]],
+  corr_axys_adip_jk_leu_ppc_age[["axys_pops_adip_dioxin_jk_leu"]][["raw_results"]],
+  corr_axys_adip_jk_leu_ppc_bmi[["axys_pops_adip_dioxin_jk_leu"]][["raw_results"]],
+  corr_axys_adip_jk_leu_ppc_age_bmi[["axys_pops_adip_dioxin_jk_leu"]][["raw_results"]]
+  )
+
+corr_axys_adip_dioxin_jk_leu_ppc_res <- reduce(corr_axys_adip_dioxin_jk_leu_ppc_list, left_join, by = c("var1", "var2")) %>%
+  rename_with(~ str_replace_all(., "\\.x\\.x$", "_bmi")) %>%      # Replace .x.x first
+  rename_with(~ str_replace_all(., "\\.y\\.y$", "_age_bmi")) %>% # Replace .y.y next
+  rename_with(~ str_replace_all(., "\\.x$", "_null")) %>%        # Replace .x after
+  rename_with(~ str_replace_all(., "\\.y$", "_age"))
+
+corr_axys_adip_dioxin_jk_leu_ppc_res2 <- corr_axys_adip_dioxin_jk_leu_ppc_res %>%
+  mutate(estimate_diff_age_null = estimate_age - estimate_null,
+         estimate_diff_bmi_null = estimate_bmi - estimate_null,
+         estimate_diff_agebmi_null = estimate_age_bmi - estimate_null) %>%
+  mutate(across(starts_with("estimate"), ~ round(.x, digits = 3))) %>%
+  relocate(var1, var2, starts_with("estimate"), .before = everything()) %>%
+  dplyr::filter(!str_detect(var1, "JK"), 
+                !str_detect(var1, "Age"), 
+                !str_detect(var1, "BMI"),
+                str_detect(var2, "JK"))
+
+# [ADIPOSE] Partial correlation results comparison: PCBs vs JK leucine perifusion
+corr_axys_adip_pcb_jk_leu_ppc_list <- list(
+  corr_axys_adip_jk_leu_ppc_null[["axys_pops_adip_pcb_jk_leu"]][["raw_results"]],
+  corr_axys_adip_jk_leu_ppc_age[["axys_pops_adip_pcb_jk_leu"]][["raw_results"]],
+  corr_axys_adip_jk_leu_ppc_bmi[["axys_pops_adip_pcb_jk_leu"]][["raw_results"]],
+  corr_axys_adip_jk_leu_ppc_age_bmi[["axys_pops_adip_pcb_jk_leu"]][["raw_results"]]
+  )
+
+corr_axys_adip_pcb_jk_leu_ppc_res <- reduce(corr_axys_adip_pcb_jk_leu_ppc_list, left_join, by = c("var1", "var2")) %>%
+  rename_with(~ str_replace_all(., "\\.x\\.x$", "_bmi")) %>%      # Replace .x.x first
+  rename_with(~ str_replace_all(., "\\.y\\.y$", "_age_bmi")) %>% # Replace .y.y next
+  rename_with(~ str_replace_all(., "\\.x$", "_null")) %>%        # Replace .x after
+  rename_with(~ str_replace_all(., "\\.y$", "_age"))
+
+corr_axys_adip_pcb_jk_leu_ppc_res2 <- corr_axys_adip_pcb_jk_leu_ppc_res %>%
+  mutate(estimate_diff_age_null = estimate_age - estimate_null,
+         estimate_diff_bmi_null = estimate_bmi - estimate_null,
+         estimate_diff_agebmi_null = estimate_age_bmi - estimate_null) %>%
+  mutate(across(starts_with("estimate"), ~ round(.x, digits = 3))) %>%
+  relocate(var1, var2, starts_with("estimate"), .before = everything()) %>%
+  dplyr::filter(!str_detect(var1, "JK"), 
+                !str_detect(var1, "Age"), 
+                !str_detect(var1, "BMI"),
+                str_detect(var2, "JK"))
+
+# [ADIPOSE] Partial correlation results comparison: OCPs vs JK leucine perifusion
+corr_axys_adip_ocp_jk_leu_ppc_list <- list(
+  corr_axys_adip_jk_leu_ppc_null[["axys_pops_adip_ocp_jk_leu"]][["raw_results"]],
+  corr_axys_adip_jk_leu_ppc_age[["axys_pops_adip_ocp_jk_leu"]][["raw_results"]],
+  corr_axys_adip_jk_leu_ppc_bmi[["axys_pops_adip_ocp_jk_leu"]][["raw_results"]],
+  corr_axys_adip_jk_leu_ppc_age_bmi[["axys_pops_adip_ocp_jk_leu"]][["raw_results"]]
+  )
+
+corr_axys_adip_ocp_jk_leu_ppc_res <- reduce(corr_axys_adip_ocp_jk_leu_ppc_list, left_join, by = c("var1", "var2")) %>%
+  rename_with(~ str_replace_all(., "\\.x\\.x$", "_bmi")) %>%      # Replace .x.x first
+  rename_with(~ str_replace_all(., "\\.y\\.y$", "_age_bmi")) %>% # Replace .y.y next
+  rename_with(~ str_replace_all(., "\\.x$", "_null")) %>%        # Replace .x after
+  rename_with(~ str_replace_all(., "\\.y$", "_age"))
+
+corr_axys_adip_ocp_jk_leu_ppc_res2 <- corr_axys_adip_ocp_jk_leu_ppc_res %>%
+  mutate(estimate_diff_age_null = estimate_age - estimate_null,
+         estimate_diff_bmi_null = estimate_bmi - estimate_null,
+         estimate_diff_agebmi_null = estimate_age_bmi - estimate_null) %>%
+  mutate(across(starts_with("estimate"), ~ round(.x, digits = 3))) %>%
+  relocate(var1, var2, starts_with("estimate"), .before = everything()) %>%
+  dplyr::filter(!str_detect(var1, "JK"), 
+                !str_detect(var1, "Age"), 
+                !str_detect(var1, "BMI"),
+                str_detect(var2, "JK"))
+```
+
+```{r}
+# [ADIPOSE] Partial correlation results comparison: dioxins vs JK fatty acid perifusion
+corr_axys_adip_dioxin_jk_fa_ppc_list <- list(
+  corr_axys_adip_jk_fa_ppc_null[["axys_pops_adip_dioxin_jk_fa"]][["raw_results"]],
+  corr_axys_adip_jk_fa_ppc_age[["axys_pops_adip_dioxin_jk_fa"]][["raw_results"]],
+  corr_axys_adip_jk_fa_ppc_bmi[["axys_pops_adip_dioxin_jk_fa"]][["raw_results"]],
+  corr_axys_adip_jk_fa_ppc_age_bmi[["axys_pops_adip_dioxin_jk_fa"]][["raw_results"]]
+  )
+
+corr_axys_adip_dioxin_jk_fa_ppc_res <- reduce(corr_axys_adip_dioxin_jk_fa_ppc_list, left_join, by = c("var1", "var2")) %>%
+  rename_with(~ str_replace_all(., "\\.x\\.x$", "_bmi")) %>%      # Replace .x.x first
+  rename_with(~ str_replace_all(., "\\.y\\.y$", "_age_bmi")) %>% # Replace .y.y next
+  rename_with(~ str_replace_all(., "\\.x$", "_null")) %>%        # Replace .x after
+  rename_with(~ str_replace_all(., "\\.y$", "_age"))
+
+corr_axys_adip_dioxin_jk_fa_ppc_res2 <- corr_axys_adip_dioxin_jk_fa_ppc_res %>%
+  mutate(estimate_diff_age_null = estimate_age - estimate_null,
+         estimate_diff_bmi_null = estimate_bmi - estimate_null,
+         estimate_diff_agebmi_null = estimate_age_bmi - estimate_null) %>%
+  mutate(across(starts_with("estimate"), ~ round(.x, digits = 3))) %>%
+  relocate(var1, var2, starts_with("estimate"), .before = everything()) %>%
+  dplyr::filter(!str_detect(var1, "JK"), 
+                !str_detect(var1, "Age"), 
+                !str_detect(var1, "BMI"),
+                str_detect(var2, "JK"))
+
+# [ADIPOSE] Partial correlation results comparison: PCBs vs JK fatty acid perifusion
+corr_axys_adip_pcb_jk_fa_ppc_list <- list(
+  corr_axys_adip_jk_fa_ppc_null[["axys_pops_adip_pcb_jk_fa"]][["raw_results"]],
+  corr_axys_adip_jk_fa_ppc_age[["axys_pops_adip_pcb_jk_fa"]][["raw_results"]],
+  corr_axys_adip_jk_fa_ppc_bmi[["axys_pops_adip_pcb_jk_fa"]][["raw_results"]],
+  corr_axys_adip_jk_fa_ppc_age_bmi[["axys_pops_adip_pcb_jk_fa"]][["raw_results"]]
+  )
+
+corr_axys_adip_pcb_jk_fa_ppc_res <- reduce(corr_axys_adip_pcb_jk_fa_ppc_list, left_join, by = c("var1", "var2")) %>%
+  rename_with(~ str_replace_all(., "\\.x\\.x$", "_bmi")) %>%      # Replace .x.x first
+  rename_with(~ str_replace_all(., "\\.y\\.y$", "_age_bmi")) %>% # Replace .y.y next
+  rename_with(~ str_replace_all(., "\\.x$", "_null")) %>%        # Replace .x after
+  rename_with(~ str_replace_all(., "\\.y$", "_age"))
+
+corr_axys_adip_pcb_jk_fa_ppc_res2 <- corr_axys_adip_pcb_jk_fa_ppc_res %>%
+  mutate(estimate_diff_age_null = estimate_age - estimate_null,
+         estimate_diff_bmi_null = estimate_bmi - estimate_null,
+         estimate_diff_agebmi_null = estimate_age_bmi - estimate_null) %>%
+  mutate(across(starts_with("estimate"), ~ round(.x, digits = 3))) %>%
+  relocate(var1, var2, starts_with("estimate"), .before = everything()) %>%
+  dplyr::filter(!str_detect(var1, "JK"), 
+                !str_detect(var1, "Age"), 
+                !str_detect(var1, "BMI"),
+                str_detect(var2, "JK"))
+
+# [ADIPOSE] Partial correlation results comparison: OCPs vs JK fatty acid perifusion
+corr_axys_adip_ocp_jk_fa_ppc_list <- list(
+  corr_axys_adip_jk_fa_ppc_null[["axys_pops_adip_ocp_jk_fa"]][["raw_results"]],
+  corr_axys_adip_jk_fa_ppc_age[["axys_pops_adip_ocp_jk_fa"]][["raw_results"]],
+  corr_axys_adip_jk_fa_ppc_bmi[["axys_pops_adip_ocp_jk_fa"]][["raw_results"]],
+  corr_axys_adip_jk_fa_ppc_age_bmi[["axys_pops_adip_ocp_jk_fa"]][["raw_results"]]
+  )
+
+corr_axys_adip_ocp_jk_fa_ppc_res <- reduce(corr_axys_adip_ocp_jk_fa_ppc_list, left_join, by = c("var1", "var2")) %>%
+  rename_with(~ str_replace_all(., "\\.x\\.x$", "_bmi")) %>%      # Replace .x.x first
+  rename_with(~ str_replace_all(., "\\.y\\.y$", "_age_bmi")) %>% # Replace .y.y next
+  rename_with(~ str_replace_all(., "\\.x$", "_null")) %>%        # Replace .x after
+  rename_with(~ str_replace_all(., "\\.y$", "_age"))
+
+corr_axys_adip_ocp_jk_fa_ppc_res2 <- corr_axys_adip_ocp_jk_fa_ppc_res %>%
+  mutate(estimate_diff_age_null = estimate_age - estimate_null,
+         estimate_diff_bmi_null = estimate_bmi - estimate_null,
+         estimate_diff_agebmi_null = estimate_age_bmi - estimate_null) %>%
+  mutate(across(starts_with("estimate"), ~ round(.x, digits = 3))) %>%
+  relocate(var1, var2, starts_with("estimate"), .before = everything()) %>%
+  dplyr::filter(!str_detect(var1, "JK"), 
+                !str_detect(var1, "Age"), 
+                !str_detect(var1, "BMI"),
+                str_detect(var2, "JK"))
+```
+
+```{r}
+# [ADIPOSE] Partial correlation results comparison: dioxin vs MH glucose perifusion
+corr_axys_adip_dioxin_mh_glu_ppc_list <- list(
+  corr_axys_adip_mh_glu_ppc_null[["axys_pops_adip_dioxin_mh_glu"]][["raw_results"]],
+  corr_axys_adip_mh_glu_ppc_age[["axys_pops_adip_dioxin_mh_glu"]][["raw_results"]],
+  corr_axys_adip_mh_glu_ppc_bmi[["axys_pops_adip_dioxin_mh_glu"]][["raw_results"]],
+  corr_axys_adip_mh_glu_ppc_age_bmi[["axys_pops_adip_dioxin_mh_glu"]][["raw_results"]]
+  )
+
+corr_axys_adip_dioxin_mh_glu_ppc_res <- reduce(corr_axys_adip_dioxin_mh_glu_ppc_list, left_join, by = c("var1", "var2")) %>%
+  rename_with(~ str_replace_all(., "\\.x\\.x$", "_bmi")) %>%      # Replace .x.x first
+  rename_with(~ str_replace_all(., "\\.y\\.y$", "_age_bmi")) %>% # Replace .y.y next
+  rename_with(~ str_replace_all(., "\\.x$", "_null")) %>%        # Replace .x after
+  rename_with(~ str_replace_all(., "\\.y$", "_age"))
+
+corr_axys_adip_dioxin_mh_glu_ppc_res2 <- corr_axys_adip_dioxin_mh_glu_ppc_res %>%
+  mutate(estimate_diff_age_null = estimate_age - estimate_null,
+         estimate_diff_bmi_null = estimate_bmi - estimate_null,
+         estimate_diff_agebmi_null = estimate_age_bmi - estimate_null) %>%
+  mutate(across(starts_with("estimate"), ~ round(.x, digits = 3))) %>%
+  relocate(var1, var2, starts_with("estimate"), .before = everything()) %>%
+  dplyr::filter(!str_detect(var1, "MH"), 
+                !str_detect(var1, "Age"), 
+                !str_detect(var1, "BMI"),
+                str_detect(var2, "MH"))
+
+# [ADIPOSE] Partial correlation results comparison: PCBs vs MH glucose perifusion
+corr_axys_adip_pcb_mh_glu_ppc_list <- list(
+  corr_axys_adip_mh_glu_ppc_null[["axys_pops_adip_pcb_mh_glu"]][["raw_results"]],
+  corr_axys_adip_mh_glu_ppc_age[["axys_pops_adip_pcb_mh_glu"]][["raw_results"]],
+  corr_axys_adip_mh_glu_ppc_bmi[["axys_pops_adip_pcb_mh_glu"]][["raw_results"]],
+  corr_axys_adip_mh_glu_ppc_age_bmi[["axys_pops_adip_pcb_mh_glu"]][["raw_results"]]
+  )
+
+corr_axys_adip_pcb_mh_glu_ppc_res <- reduce(corr_axys_adip_pcb_mh_glu_ppc_list, left_join, by = c("var1", "var2")) %>%
+  rename_with(~ str_replace_all(., "\\.x\\.x$", "_bmi")) %>%      # Replace .x.x first
+  rename_with(~ str_replace_all(., "\\.y\\.y$", "_age_bmi")) %>% # Replace .y.y next
+  rename_with(~ str_replace_all(., "\\.x$", "_null")) %>%        # Replace .x after
+  rename_with(~ str_replace_all(., "\\.y$", "_age"))
+
+corr_axys_adip_pcb_mh_glu_ppc_res2 <- corr_axys_adip_pcb_mh_glu_ppc_res %>%
+  mutate(estimate_diff_age_null = estimate_age - estimate_null,
+         estimate_diff_bmi_null = estimate_bmi - estimate_null,
+         estimate_diff_agebmi_null = estimate_age_bmi - estimate_null) %>%
+  mutate(across(starts_with("estimate"), ~ round(.x, digits = 3))) %>%
+  relocate(var1, var2, starts_with("estimate"), .before = everything()) %>%
+  dplyr::filter(!str_detect(var1, "MH"), 
+                !str_detect(var1, "Age"), 
+                !str_detect(var1, "BMI"),
+                str_detect(var2, "MH"))
+
+# [ADIPOSE] Partial correlation results comparison: OCPs vs MH glucose perifusion
+corr_axys_adip_ocp_mh_glu_ppc_list <- list(
+  corr_axys_adip_mh_glu_ppc_null[["axys_pops_adip_ocp_mh_glu"]][["raw_results"]],
+  corr_axys_adip_mh_glu_ppc_age[["axys_pops_adip_ocp_mh_glu"]][["raw_results"]],
+  corr_axys_adip_mh_glu_ppc_bmi[["axys_pops_adip_ocp_mh_glu"]][["raw_results"]],
+  corr_axys_adip_mh_glu_ppc_age_bmi[["axys_pops_adip_ocp_mh_glu"]][["raw_results"]]
+  )
+
+corr_axys_adip_ocp_mh_glu_ppc_res <- reduce(corr_axys_adip_ocp_mh_glu_ppc_list, left_join, by = c("var1", "var2")) %>%
+  rename_with(~ str_replace_all(., "\\.x\\.x$", "_bmi")) %>%      # Replace .x.x first
+  rename_with(~ str_replace_all(., "\\.y\\.y$", "_age_bmi")) %>% # Replace .y.y next
+  rename_with(~ str_replace_all(., "\\.x$", "_null")) %>%        # Replace .x after
+  rename_with(~ str_replace_all(., "\\.y$", "_age"))
+
+corr_axys_adip_ocp_mh_glu_ppc_res2 <- corr_axys_adip_ocp_mh_glu_ppc_res %>%
+  mutate(estimate_diff_age_null = estimate_age - estimate_null,
+         estimate_diff_bmi_null = estimate_bmi - estimate_null,
+         estimate_diff_agebmi_null = estimate_age_bmi - estimate_null) %>%
+  mutate(across(starts_with("estimate"), ~ round(.x, digits = 3))) %>%
+  relocate(var1, var2, starts_with("estimate"), .before = everything()) %>%
+  dplyr::filter(!str_detect(var1, "MH"), 
+                !str_detect(var1, "Age"), 
+                !str_detect(var1, "BMI"),
+                str_detect(var2, "MH"))
+```
+
+```{r}
+# Combine all partial correlation results in one dataframe for each tissue (pancreas, adipose)
+
+# Pancreas
+panc_ppc_results_list <- list(
+  # Pancreas pollutants vs IsletCore
+  corr_axys_panc_dioxin_core_ppc_res2,
+  corr_axys_panc_pcb_core_ppc_res2,
+  corr_axys_panc_ocp_core_ppc_res2,
+  # Pancreas pollutants vs JK glucose perifusion
+  corr_axys_panc_dioxin_jk_glu_ppc_res2,
+  corr_axys_panc_pcb_jk_glu_ppc_res2,
+  corr_axys_panc_ocp_jk_glu_ppc_res2,
+  # Pancreas pollutants vs JK leucine perifusion
+  corr_axys_panc_dioxin_jk_leu_ppc_res2,
+  corr_axys_panc_pcb_jk_leu_ppc_res2,
+  corr_axys_panc_ocp_jk_leu_ppc_res2,
+  # Pancreas pollutants vs JK fatty acid perifusion
+  corr_axys_panc_dioxin_jk_fa_ppc_res2,
+  corr_axys_panc_pcb_jk_fa_ppc_res2,
+  corr_axys_panc_ocp_jk_fa_ppc_res2,
+  # Pancreas pollutants vs MH glucose perifusion
+  corr_axys_panc_dioxin_mh_glu_ppc_res2,
+  corr_axys_panc_pcb_mh_glu_ppc_res2,
+  corr_axys_panc_ocp_mh_glu_ppc_res2
+)
+
+panc_ppc_results_all <- bind_rows(panc_ppc_results_list) %>%
+  mutate(TISSUE = "Pancreas") %>%
+  relocate(TISSUE)
+
+#Adipose
+adip_ppc_results_list <- list(
+  # Adipose pollutants vs IsletCore
+  corr_axys_adip_dioxin_core_ppc_res2,
+  corr_axys_adip_pcb_core_ppc_res2,
+  corr_axys_adip_ocp_core_ppc_res2,
+  # Adipose pollutants vs JK glucose perifusion
+  corr_axys_adip_dioxin_jk_glu_ppc_res2,
+  corr_axys_adip_pcb_jk_glu_ppc_res2,
+  corr_axys_adip_ocp_jk_glu_ppc_res2,
+  # Adipose pollutants vs JK leucine perifusion
+  corr_axys_adip_dioxin_jk_leu_ppc_res2,
+  corr_axys_adip_pcb_jk_leu_ppc_res2,
+  corr_axys_adip_ocp_jk_leu_ppc_res2,
+  # Adipose pollutants vs JK fatty acid perifusion
+  corr_axys_adip_dioxin_jk_fa_ppc_res2,
+  corr_axys_adip_pcb_jk_fa_ppc_res2,
+  corr_axys_adip_ocp_jk_fa_ppc_res2,
+  # Adipose pollutants vs MH glucose perifusion
+  corr_axys_adip_dioxin_mh_glu_ppc_res2,
+  corr_axys_adip_pcb_mh_glu_ppc_res2,
+  corr_axys_adip_ocp_mh_glu_ppc_res2
+)
+
+adip_ppc_results_all <- bind_rows(adip_ppc_results_list) %>%
+  mutate(TISSUE = "Adipose") %>%
+  relocate(TISSUE)
+
+# write_csv(panc_ppc_results_all, "2025-01-28_pancreas_pollutants_vs_functional_parameters_partial_correlations_AC.csv")
+# write_csv(adip_ppc_results_all, "2025-01-28_adipose_pollutants_vs_functional_parameters_partial_correlations_AC.csv")
+```
+
+
+```{r}
+sessionInfo()
+```

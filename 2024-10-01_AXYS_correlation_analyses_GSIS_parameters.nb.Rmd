@@ -1,0 +1,2273 @@
+---
+title: "Correlating AXYS pollutant data with GSIS parameters"
+author: "Angela Ching"
+date: "`r Sys.Date()`"
+output: 
+  html_notebook:
+    toc: yes
+---
+
+# Notes from MH
+
+IsletCore GSIS:
+- Condition #1 = LG 2.8mM, HG 16.7mM 
+- Condition #2 = LG 1mM, HG 16.7mM
+- Condition #3 = LG 1mM, HG 10mM
+
+Perifusion:
+- Exclude KCl for donors: R361, R362, R385, R391 (already removed from final excel)
+- Only use basal LG (exclude the rest of perifusion curve) for donors: R419, R421 (already removed from final excel)
+- Do sensitivity analysis with donor R417
+
+Exclusion criteria
+- Remove any analyte with >50% donors below LOD
+- Remove any analyte with >40% of donors with NDR flag
+
+```{r}
+# Get today's date for saving plots
+date_today <- Sys.Date()
+```
+
+# Packages
+
+```{r packages}
+library(tidyverse)
+library(readxl)
+library(ggplot2)
+library(janitor)      # for data cleaning
+library(scico)        # colour palettes
+library(ggsci)        # colour palettes
+library(ggpubr)       # for scatterplot correlations
+library(psychometric) # masks "select" from dplyr; for CIr()
+library(purrr)        # for mapping heatmaps
+library(reshape2)     # for reshaping data for heatmaps
+library(knitr)
+library(pheatmap)
+library(corrplot)
+library(psych)
+library(lme4)
+```
+
+# Custom functions
+
+```{r correlation_tests}
+# Correlation tests
+
+cor.mtest <- function(df, method = "kendall", ...) {
+    n <- ncol(df)
+    mat <- as.matrix(df[, 2:n])
+    cor <- psych::corTest(mat, method = method, adjust = "fdr", use = "pairwise")
+    cormat <- as.matrix(cor$r)
+    pmat <- as.matrix(cor$p)
+    return(list(cormat, pmat, cor))
+}
+
+# Flatten correlation matrix
+cor.flat <- function(df, method = "kendall", ...) {
+  n <- ncol(df)
+  mat <- as.matrix(df[, 2:n])
+  cor <- psych::corTest(mat, method = method, adjust = "fdr", use = "pairwise")
+    
+  # Convert p matrix to a data frame
+  p_df <- as.data.frame(cor$p)
+  p_df$row <- rownames(p_df)
+  
+  # Convert r matrix to a data frame
+  r_df <- as.data.frame(cor$r)
+  r_df$row <- rownames(r_df)
+  
+  # Melt the p matrix
+  melted_p <- melt(p_df, id.vars = c("row"), variable.name = "column", value.name = "p")
+  
+  # Melt the r matrix
+  melted_r <- melt(r_df, id.vars = c("row"), variable.name = "column", value.name = "r")
+  
+  # Combine the melted p and r data frames
+  final_data <- left_join(melted_r, melted_p, by = c("row", "column")) %>%
+  distinct(row, column, .keep_all = TRUE) %>%
+  mutate(p_adj = p.adjust(.$p, method = "fdr"))
+  
+  return(final_data)
+}
+```
+
+```{r}
+# Plotting correlation matrix for Prism
+cor.flat.for.prism <- function(df, method = "kendall", ...) {
+  n <- ncol(df)
+  mat <- as.matrix(df[, 2:n])
+  cor_result <- psych::corTest(mat, method = method, use = "pairwise")
+  
+  # Extract Kendall's r values
+  r_values <- cor_result$r
+  
+  # Keep only the upper triangle and diagonal elements
+  upper_triangle <- upper.tri(r_values, diag = TRUE)
+  r_values[!upper_triangle] <- NA
+  
+  # Convert r matrix to a data frame
+  r_df <- as.data.frame(r_values)
+  
+  return(r_df)
+}
+
+# cor.flat.for.prism <- function(df, method = "kendall", row_filter = NULL, column_filter = NULL, ...) {
+#   n <- ncol(df)
+#   mat <- as.matrix(df[, 2:n])
+#   cor_result <- psych::corTest(mat, method = method, use = "pairwise")
+#   
+#   # Extract Kendall's r values
+#   r_values <- cor_result$r
+#   
+#   # Keep only the upper triangle and diagonal elements
+#   upper_triangle <- upper.tri(r_values, diag = TRUE)
+#   r_values[!upper_triangle] <- NA
+#   
+#   # Convert r matrix to a data frame
+#   r_df <- as.data.frame(r_values)
+#   
+#   # Handle NA row names by replacing them with a placeholder
+#   row_names <- rownames(df)[2:n]
+#   row_names[is.na(row_names)] <- "NA_row"  # Replace NA row names with "NA_row"
+#   
+#   # Ensure row names are unique
+#   rownames(r_df) <- make.unique(row_names)
+#   colnames(r_df) <- colnames(df)[2:n]
+#   
+#   # Melt the r_df to get long format for filtering
+#   r_long <- reshape2::melt(as.matrix(r_df), varnames = c("row", "column"), value.name = "r")
+#   
+#   # Apply the row and column filters if provided
+#   if (!is.null(row_filter)) {
+#     r_long <- r_long %>%
+#       dplyr::filter(!stringr::str_detect(row, row_filter))
+#   }
+#   
+#   if (!is.null(column_filter)) {
+#     r_long <- r_long %>%
+#       dplyr::filter(stringr::str_detect(column, column_filter))
+#   }
+#   
+#   # Reshape back into a wide format to get the triangle matrix again
+#   r_wide <- reshape2::acast(r_long, row ~ column, value.var = "r")
+#   
+#   return(as.data.frame(r_wide))
+# }
+```
+
+```{r}
+# Colour palettes
+col <- colorRampPalette(c("#BB4444", "#EE9988", "#FFFFFF", "#77AADD", "#4477AA"))
+custom_palette <- c("#BB4444", "#EE9988", "#FFFFFF", "#77AADD", "#4477AA")
+
+# Plot correlation
+plot_correlation <- function(corrplot_data, index) {
+  corrplot(corrplot_data[[1]], type = "upper", order = "original", method = "circle", cl.align.text = "l", diag = FALSE,
+           addCoef.col = 'grey20', sig.level = 1, insig = 'blank',
+           number.cex = 0.5, p.mat = corrplot_data[[2]], tl.col = "black", tl.srt = 45, tl.cex = 0.75)
+}
+
+# Generate and save correlation plots with flexible parameters
+generate_and_save_corrplot <- function(filename, corrplot_data, width, height, show_legend = TRUE) {
+  png(filename = filename, width = width, height = height, units = "in", res = 600)
+  
+  # Conditional cl.pos based on show_legend argument
+  legend_position <- ifelse(show_legend, "l", "n")
+  
+  corrplot(corrplot_data[[1]], type = "upper", order = "original", method = "circle", 
+           cl.align.text = legend_position, diag = FALSE, 
+           addCoef.col = 'gray20', sig.level = 1, insig = 'blank', col = col(10),
+           number.cex = 0.5, p.mat = corrplot_data[[2]], tl.col = "black", tl.srt = 45, tl.cex = 0.75,
+           cl.pos = legend_position)
+  
+  dev.off()
+}
+```
+
+```{r}
+# Function for making correlation tables (x axis titles at a 45 degree angle)
+plot_table <- function(data) {
+  ggplot(data, aes(row, column, fill = r)) +
+    geom_tile() +
+    theme_minimal() +
+    scale_fill_gradientn(colors = custom_palette, limits = c(-1, 1)) +
+    # Additional scale_fill functions can be added here if needed
+    theme(panel.grid = element_blank(),
+          axis.title.x = element_blank(),
+          axis.title.y = element_blank(),
+          legend.spacing.y = unit(0.5, 'cm'),
+          legend.title = element_text(size = 10),
+          axis.text.x = element_text(size = 10, hjust = 1, angle = 45,  vjust = 1),
+          axis.text.y = element_text(size = 10)) +
+    geom_text(aes(label = round(r, 2)), color = "black", size = 2.5) +
+    labs(fill = str_wrap("Kendall's coefficient", width = 12))
+}
+
+# Tables for correlations with donor characteristics (horizontal x axis titles)
+plot_table_meta <- function(data) {
+  ggplot(data, aes(row, column, fill = r)) +
+    geom_tile() +
+    theme_minimal() +
+    scale_fill_gradientn(colors = custom_palette, limits = c(-1, 1)) +
+    theme(panel.grid = element_blank(),
+          axis.title.x = element_blank(),
+          axis.title.y = element_blank(),
+          legend.spacing.y = unit(0.5, 'cm'),
+          legend.title = element_text(size = 10),
+          axis.text.x = element_text(size = 10, hjust = 0.5, angle = 0,  vjust = 1),
+          axis.text.y = element_text(size = 10)) +
+    geom_text(aes(label = round(r, 2)), color = "black", size = 2.5) +
+    labs(fill = str_wrap("Kendall's coefficient", width = 12))
+}
+```
+
+```{r}
+# Functions for performing Kendall correlations and filtering rows and columns by lab or data type
+cor.mh <- function(df) {
+  df %>%
+    cor.flat() %>%
+    dplyr::filter(!str_detect(row, "MH"), str_detect(column, "MH"))
+}
+
+cor.jk <- function(df) {
+  df %>%
+    cor.flat() %>%
+    dplyr::filter(!str_detect(row, "JK"), str_detect(column, "JK"))
+}
+
+cor.adi <- function(df) {
+  df %>%
+    cor.flat() %>%
+    dplyr::filter(!str_detect(row, "IsletCore"), str_detect(column, "IsletCore"))
+}
+
+cor.meta <- function(df) {
+  df %>%
+    cor.flat() %>%
+    dplyr::filter((row == "Age" | row == "BMI" | row == "Hba1c") &
+         !(column == "Age" | column == "BMI" | column == "Hba1c"))
+}
+```
+
+```{r}
+combine_correlations <- function(initial_corr, new_corr) {
+  # Left join the two correlation tables based on 'row' and 'column'
+  combined_corr <- dplyr::left_join(initial_corr, new_corr, by = c("row", "column"), suffix = c("_initial", "_new"))
+  
+  # Calculate the absolute percent change in r and add it as a new column
+  combined_corr <- combined_corr %>%
+    mutate(r_difference = round(abs(r_new - r_initial), 2),
+           percent_change_r = round(abs((r_new - r_initial) / r_initial) * 100, 2),
+           percent_change_r_dir = round((r_new - r_initial) / abs(r_initial) * 100, 2))
+  
+  return(combined_corr)
+}
+```
+
+```{r}
+# Save correlation matrices for export to prism
+save_correlation_matrices <- function(correlation_list, date_today) {
+  # Iterate over the outer list with imap
+  imap(correlation_list, ~ {
+    # Iterate over each sublist with imap
+    imap(.x, ~ {
+      # Create the file name for each element in the sublist
+      file_name <- paste0(date_today, "_", .y, "_", .y, ".csv")
+      # Write the CSV file
+      write.csv(x = .x, file = file_name, row.names = TRUE)
+    })
+  })
+}
+```
+
+# Load AXYS data
+
+```{r}
+# load chemical list
+chem_list <- read_csv("../../data/2022-10-18_AXYS_chemicals_list_AC.csv") %>%
+  dplyr::select(Compound, Dioxin_subtype) %>%
+  mutate(across(where(is.character), str_squish))
+
+chem_list_2 <- read_csv("../../data/2024-10-01_AXYS_chemicals_list_with_coelutions.csv") %>%
+  dplyr::select(-c(Dioxin_subtype, Type)) %>%
+  mutate(across(where(is.character), str_squish))
+
+# load AXYS data
+axys_pops <- read_csv("../../outputs/2024-08-24_ProjectGrant_excluded_outliers_for_single_analyte_analyses.csv") %>%
+  dplyr::select(-c(CONC_BLANK_adj, IS_BLANK_ADJ_CONC_HIGHER_THAN_LOD)) %>%
+  mutate(BLANK_and_LOD_adj = as.numeric(BLANK_and_LOD_adj),
+         File = factor(File),
+         COMPOUND = case_when(str_detect(COMPOUND, "TOTAL") ~ str_to_sentence(COMPOUND),
+                              str_detect(COMPOUND, " Epoxide") ~ str_to_sentence(COMPOUND),
+                              TRUE ~ COMPOUND),
+         across(where(is.character), str_squish))
+
+axys_pops_2 <- axys_pops %>%
+  dplyr::select(-c(File, LAB_FLAG, DETECTION_LIMIT)) %>%
+  mutate(across(where(is.character), str_squish))
+
+# load AXYS data with imputed values for true NAs (chemicals not measured by AXYS in certain donors)
+axys_pops_imputed_panc <- read_excel("../../outputs/2024-09-03_axys_pops_includes_imputed_values_for_true_NAs_using_mice_package.xlsx", sheet = 1) %>%
+  mutate(across(where(is.character), str_squish))
+
+axys_pops_imputed_adip <- read_excel("../../outputs/2024-09-03_axys_pops_includes_imputed_values_for_true_NAs_using_mice_package.xlsx", sheet = 2) %>%
+  mutate(across(where(is.character), str_squish))
+
+# load AXYS donor metadata
+axys_metadata <- read_csv("../../data/2024-08-22_donor_characteristics_FINAL.csv", show_col_types = FALSE) %>%
+  mutate(BMI_category = case_when(BMI < 24.9 ~ "Lean",
+                                  BMI >= 24.9 & BMI <= 29.9 ~ "Overweight",
+                                  BMI > 29.9 ~ "Obese"),
+         Hba1c_category = case_when(Hba1c < 6 ~ "Normoglycemic",
+                                    Hba1c <= 6.5 ~ "Prediabetic",
+                                    Hba1c > 6.5 ~ "Diabetic"),
+         BMI_category = factor(BMI_category, levels = c("Lean", "Overweight", "Obese")),
+         Hba1c_category = factor(Hba1c_category, levels = c("Normoglycemic", "Prediabetic", "Diabetic")),
+         Sex = as_factor(Sex),
+         Diabetes_status = as_factor(Diabetes_status)) %>%
+  dplyr::select(-Purity)
+
+# Donor IDs
+axys_donors <- axys_metadata %>%
+  dplyr::select(Id)
+
+# Subset data by tissue type
+subset_tissue <- function(tissue) {
+  axys_pops_2 %>%
+    dplyr::filter(!str_detect(COMPOUND, "Total"), TISSUE_TYPE == tissue) %>%
+    dplyr::select(DONOR, COMPOUND, BLANK_and_LOD_adj) %>%
+    group_by(DONOR) %>%
+    pivot_wider(names_from = COMPOUND, values_from = BLANK_and_LOD_adj) %>%
+    ungroup()
+}
+
+axys_pops_panc <- subset_tissue("Pancreas")
+axys_pops_adip <- subset_tissue("Adipose")
+```
+
+# Load static GSIS and perifusion data
+
+```{r}
+# load GSIS data from ADI
+gsis_adi_all_ave <- read_excel("../../data/Perifusion+GSIS/2024-05-18_IsletCore_GSIS_from_TeamGrant_website.xlsx") %>%
+  dplyr::mutate_at(c(4:7), as.numeric) %>%
+  group_by(Donor, Cond) %>%
+  dplyr::mutate(Cond = factor(Cond, levels = c("1", "2", "3")),
+                InsulinContent_IsletCore = mean(InsulinContent),
+                LG_IsletCore = mean(LG, na.rm = TRUE),
+                HG_IsletCore = mean(HG, na.rm = TRUE),
+                SI_IsletCore = mean(SI, na.rm = TRUE),
+                .keep = c("unused")) %>%
+  distinct(Donor, Cond, .keep_all = TRUE) %>%
+  dplyr::select(-replicate) %>%
+  ungroup()
+  
+gsis_adi <- gsis_adi_all_ave %>%
+  pivot_wider(names_from = Cond, values_from = c(InsulinContent_IsletCore, LG_IsletCore, HG_IsletCore, SI_IsletCore)) %>%
+  relocate(Donor, InsulinContent_IsletCore_1, LG_IsletCore_1, HG_IsletCore_1, SI_IsletCore_1,
+           InsulinContent_IsletCore_2, LG_IsletCore_2, HG_IsletCore_2, SI_IsletCore_2,
+           InsulinContent_IsletCore_3, LG_IsletCore_3, HG_IsletCore_3, SI_IsletCore_3)
+```
+
+```{r}
+# Load perifusion data from Jelena Kolic
+peri_jk <- read_excel("../../data/Perifusion+GSIS/2024-04-06_Jelena_all_perifusion_AUCs.xlsx") %>%
+ dplyr::mutate(PerifusionParam = str_c("JK", PerifusionParam, sep = "_"),
+         .keep = "unused") %>% 
+  dplyr::mutate_at(c(4:148), as.numeric)
+
+# Separate data based on perifusion type (glucose, leucine, oleate-pamlitate)
+glu_peri_jk <- peri_jk %>%
+  dplyr::filter(Secretagogue == "GLU") %>%
+  remove_empty("cols")
+
+leu_peri_jk <- peri_jk %>%
+  dplyr::filter(Secretagogue == "LEU") %>%
+  remove_empty("cols")
+
+fa_peri_jk <- peri_jk %>%
+  dplyr::filter(Secretagogue == "OLE-PALM") %>%
+  remove_empty("cols")
+
+# Transpose for matrices
+glu_peri_jk_t <- glu_peri_jk %>%
+  dplyr::select(-c(MainOutcome, Secretagogue)) %>%
+  t() %>%
+  as.data.frame() %>%
+  set_names(.[1, ]) %>%
+  slice_tail(., n = (nrow(.)-1)) %>%
+  mutate(Donor = rownames(.),
+         .keep = c("unused")) %>%
+  mutate(Donor = str_remove(Donor, pattern = "Donor"),
+         across(where(is.character), str_squish)) %>%
+  relocate(Donor) %>%
+  mutate_at(c(2:20), as.numeric)
+
+leu_peri_jk_t <- leu_peri_jk %>%
+  dplyr::select(-c(MainOutcome, Secretagogue)) %>%
+  t() %>%
+  as.data.frame() %>%
+  set_names(.[1, ]) %>%
+  slice_tail(., n = (nrow(.)-1)) %>%
+  mutate(Donor = rownames(.),
+         .keep = c("unused")) %>%
+  mutate(Donor = str_remove(Donor, pattern = "Donor"),
+         across(where(is.character), str_squish)) %>%
+  relocate(Donor) %>%
+  mutate_at(c(2:12), as.numeric)
+
+fa_peri_jk_t <- fa_peri_jk %>%
+  dplyr::select(-c(MainOutcome, Secretagogue)) %>%
+  t() %>%
+  as.data.frame() %>%
+  set_names(.[1, ]) %>%
+  slice_tail(., n = (nrow(.)-1)) %>%
+  mutate(Donor = rownames(.),
+         .keep = c("unused")) %>%
+  mutate(Donor = str_remove(Donor, pattern = "Donor"),
+         across(where(is.character), str_squish)) %>%
+  relocate(Donor) %>%
+  mutate_at(c(2:12), as.numeric)
+```
+
+```{r}
+# Load Myriam perifusion data
+glu_peri_mh <- read_excel("../../data/Perifusion+GSIS/2024-01-25_Perifusion_FINAL DATA_For analysis_AC.xlsx") %>%
+  mutate(PerifusionParam = str_c("MH", PerifusionParam, sep = "_"),
+         .keep = c("unused")) %>% 
+  dplyr::mutate_at(c(3:32), as.numeric)
+
+glu_peri_mh_t <- glu_peri_mh %>%
+  dplyr::select(-MainOutcome) %>%
+  t() %>%
+  as.data.frame() %>%
+  set_names(.[1, ]) %>%
+  slice_tail(., n = (nrow(.)-1)) %>%
+  mutate(Donor = rownames(.),
+         .keep = c("unused")) %>%
+  mutate(Donor = str_remove(Donor, pattern = "Donor"),
+         across(where(is.character), str_squish)) %>%
+  relocate(Donor)
+```
+
+```{r, fig.height=6.5}
+# glu_peri_mh_for_grant <- glu_peri_mh_t %>%
+#   dplyr::select(Donor, MH_LGauc, MH_HGauc_LGauc) %>%
+#   dplyr::filter(Donor != "R419", Donor != "R421")
+
+# Bubble plot: pancreas POP concentrations and perifusion outcomes
+# axys_pops_glu_peri_mh_grant <- left_join(glu_peri_mh_for_grant, axys_panc, by = c("Donor" = "DONOR")) %>%
+#   mutate(LGauc = MH_LGauc,
+#          HGauc_LGauc = MH_HGauc_LGauc,
+#          .keep = c("unused"))
+
+# axys_type <- axys_pops_2 %>%
+#   distinct(COMPOUND, Type)
+
+# axys_pops_glu_peri_mh_grant_corr <- cor.flat(axys_pops_glu_peri_mh_grant) %>%
+#   dplyr::filter(row != "LGauc", row != "HGauc_LGauc", column == "LGauc" | column == "HGauc_LGauc") %>%
+#   left_join(., axys_type, by = c("row" = "COMPOUND"))
+
+# ggplot(axys_pops_glu_peri_mh_grant_corr, aes(x = r, y = row, fill = column, size = r)) +
+#   geom_point(alpha=0.5, shape=21, color="black") +
+#   #scale_fill_viridis(discrete = TRUE, option = "D") + 
+#   scale_fill_brewer(palette = "Set1") +
+#   xlim(-1, 1) +
+#   ylab("Kendall's correlation coefficient (r)") +
+#   theme_minimal() +
+#   theme(legend.position = "right",
+#         #axis.text.x = element_text(angle = 45, hjust = 1),
+#         axis.title.x = element_blank()) +
+#   labs(fill = "Stimulation", size = "Kendall's r")
+```
+
+```{r}
+# Create compounds list
+dioxin_list <- chem_list_2 %>%
+  dplyr::filter(Dioxin_similarity == "Dioxin") %>%
+  dplyr::pull(Compound)
+
+pcb_list <- chem_list_2 %>%
+  dplyr::filter(Dioxin_similarity == "Dioxin-like" | Dioxin_similarity == "Non-dioxin-like") %>%
+  dplyr::pull(Compound)
+
+ocp_list <- chem_list_2 %>%
+  dplyr::filter(Dioxin_similarity == "OCP") %>%
+  dplyr::pull(Compound)
+```
+
+```{r}
+# Calculate sums
+axys_panc_sums <- axys_pops_panc %>%
+  pivot_longer(cols = c(2:34), names_to = "COMPOUND", values_to = "ADJ_CONC") %>%
+  left_join(., chem_list_2, by = c("COMPOUND" = "Compound")) %>%
+  group_by(DONOR, Dioxin_similarity) %>%
+  mutate(AnalyteSums = sum(ADJ_CONC, na.rm = TRUE)) %>%
+  ungroup() %>%
+  group_by(DONOR, Dioxin_similarity, AnalyteSums) %>%
+  summarise() %>%
+  pivot_wider(names_from = Dioxin_similarity, values_from = AnalyteSums) %>%
+  mutate(PCB = rowSums(across(c("Dioxin-like", "Non-dioxin-like")))) %>%
+  dplyr::select(-OCP) %>%
+  relocate(DONOR, Dioxin, PCB) %>%
+  ungroup()
+
+axys_adip_sums <- axys_pops_adip %>%
+  pivot_longer(cols = c(2:42), names_to = "COMPOUND", values_to = "ADJ_CONC") %>%
+  left_join(., chem_list_2, by = c("COMPOUND" = "Compound")) %>%
+  group_by(DONOR, Dioxin_similarity) %>%
+  mutate(AnalyteSums = sum(ADJ_CONC, na.rm = TRUE)) %>%
+  ungroup() %>%
+  group_by(DONOR, Dioxin_similarity, AnalyteSums) %>%
+  summarise() %>%
+  pivot_wider(names_from = Dioxin_similarity, values_from = AnalyteSums) %>%
+  mutate(PCB = rowSums(across(c("Dioxin-like", "Non-dioxin-like")))) %>%
+  dplyr::select(-OCP) %>%
+  relocate(DONOR, Dioxin, PCB) %>%
+  ungroup()
+
+axys_pops_imputed_panc_sums <- axys_pops_imputed_panc %>%
+  pivot_longer(cols = c(2:34), names_to = "COMPOUND", values_to = "ADJ_CONC") %>%
+  left_join(., chem_list_2, by = c("COMPOUND" = "Compound")) %>%
+  group_by(DONOR, Dioxin_similarity) %>%
+  mutate(AnalyteSums = sum(ADJ_CONC)) %>%
+  ungroup() %>%
+  group_by(DONOR, Dioxin_similarity, AnalyteSums) %>%
+  summarise() %>%
+  pivot_wider(names_from = Dioxin_similarity, values_from = AnalyteSums) %>%
+  mutate(PCB = rowSums(across(c("Dioxin-like", "Non-dioxin-like")))) %>%
+  dplyr::select(-OCP) %>%
+  relocate(DONOR, Dioxin, PCB) %>%
+  ungroup()
+
+axys_pops_imputed_adip_sums <- axys_pops_imputed_adip %>%
+  pivot_longer(cols = c(2:42), names_to = "COMPOUND", values_to = "ADJ_CONC") %>%
+  left_join(., chem_list_2, by = c("COMPOUND" = "Compound")) %>%
+  group_by(DONOR, Dioxin_similarity) %>%
+  mutate(AnalyteSums = sum(ADJ_CONC)) %>%
+  ungroup() %>%
+  group_by(DONOR, Dioxin_similarity, AnalyteSums) %>%
+  summarise() %>%
+  pivot_wider(names_from = Dioxin_similarity, values_from = AnalyteSums) %>%
+  mutate(PCB = rowSums(across(c("Dioxin-like", "Non-dioxin-like")))) %>%
+  dplyr::select(-OCP) %>%
+  relocate(DONOR, Dioxin, PCB) %>%
+  ungroup()
+```
+
+```{r}
+# Combine single analyte concentrations with sums
+axys_pops_with_sums_panc <- axys_pops_panc %>%
+  left_join(., axys_panc_sums, by = c("DONOR" = "DONOR"))
+
+axys_pops_with_sums_adip <- axys_pops_adip %>%
+  left_join(., axys_adip_sums, by = c("DONOR" = "DONOR"))
+
+axys_pops_with_sums_panc_imp <- axys_pops_imputed_panc %>%
+  left_join(., axys_pops_imputed_panc_sums, by = c("DONOR" = "DONOR"))
+  
+axys_pops_with_sums_adip_imp <- axys_pops_imputed_adip %>%
+  left_join(., axys_pops_imputed_adip_sums, by = c("DONOR" = "DONOR"))
+```
+
+```{r}
+# Combine analyte concentrations with metadata
+axys_pops_with_sums_panc_meta <- axys_pops_with_sums_panc %>%
+  left_join(., axys_metadata, by = c("DONOR" = "Id")) %>%
+  dplyr::select(-Hba1c_category)
+
+axys_pops_with_sums_adip_meta <- axys_pops_with_sums_adip %>%
+  left_join(., axys_metadata, by = c("DONOR" = "Id")) %>%
+  dplyr::select(-Hba1c_category)
+
+axys_pops_with_sums_panc_meta_imp <- axys_pops_with_sums_panc_imp %>%
+  left_join(., axys_metadata, by = c("DONOR" = "Id")) %>%
+  dplyr::select(-Hba1c_category)
+
+axys_pops_with_sums_adip_meta_imp <- axys_pops_with_sums_adip_imp %>%
+  left_join(., axys_metadata, by = c("DONOR" = "Id")) %>%
+  dplyr::select(-Hba1c_category)
+```
+
+# Sensitivity analyses
+
+```{r}
+# Remove outlier donors
+rm_ind_adip <- c("R419", "R421")
+rm_ind_panc <- c("R389", "R419", "R448")
+```
+
+
+```{r}
+## Dioxins
+
+# Pancreas
+axys_pops_panc_dioxin <- axys_pops_with_sums_panc %>%
+  dplyr::select(DONOR, any_of(dioxin_list), Dioxin)
+
+axys_pops_panc_dioxin_imp <- axys_pops_with_sums_panc_imp %>%
+  dplyr::select(DONOR, any_of(dioxin_list), Dioxin)
+
+axys_pops_panc_rm_ind_dioxin <- axys_pops_with_sums_panc %>%
+  dplyr::filter(!(DONOR %in% rm_ind_panc)) %>%
+  dplyr::select(DONOR, any_of(dioxin_list), Dioxin)
+
+axys_pops_panc_rm_389_dioxin <- axys_pops_with_sums_panc %>%
+  dplyr::filter(DONOR != "R389") %>%
+  dplyr::select(DONOR, any_of(dioxin_list), Dioxin)
+
+axys_pops_panc_rm_419_dioxin <- axys_pops_with_sums_panc %>%
+  dplyr::filter(DONOR != "R419") %>%
+  dplyr::select(DONOR, any_of(dioxin_list), Dioxin)
+
+axys_pops_panc_rm_448_dioxin <- axys_pops_with_sums_panc %>%
+  dplyr::filter(DONOR != "R448") %>%
+  dplyr::select(DONOR, any_of(dioxin_list), Dioxin)
+
+# Adipose
+axys_pops_adip_dioxin <- axys_pops_with_sums_adip %>%
+  dplyr::select(DONOR, any_of(dioxin_list), Dioxin)
+
+axys_pops_adip_dioxin_imp <- axys_pops_with_sums_adip_imp %>%
+  dplyr::select(DONOR, any_of(dioxin_list), Dioxin)
+
+axys_pops_adip_rm_ind_dioxin <- axys_pops_with_sums_adip %>%
+  dplyr::filter(!(DONOR %in% rm_ind_adip)) %>%
+  dplyr::select(DONOR, any_of(dioxin_list), Dioxin)
+
+axys_pops_adip_rm_419_dioxin <- axys_pops_with_sums_adip %>%
+  dplyr::filter(DONOR != "R419") %>%
+  dplyr::select(DONOR, any_of(dioxin_list), Dioxin)
+
+axys_pops_adip_rm_421_dioxin <- axys_pops_with_sums_adip %>%
+  dplyr::filter(DONOR != "R421") %>%
+  dplyr::select(DONOR, any_of(dioxin_list), Dioxin)
+```
+
+```{r}
+## PCBs
+
+#Pancreas
+axys_pops_panc_pcb <- axys_pops_with_sums_panc %>%
+  dplyr::select(DONOR, any_of(pcb_list), PCB, "Dioxin-like", "Non-dioxin-like")
+
+axys_pops_panc_pcb_imp <- axys_pops_with_sums_panc_imp %>%
+  dplyr::select(DONOR, any_of(pcb_list), PCB, "Dioxin-like", "Non-dioxin-like")
+
+axys_pops_panc_rm_ind_pcb <- axys_pops_with_sums_panc %>%
+  dplyr::filter(!(DONOR %in% rm_ind_panc)) %>%
+  dplyr::select(DONOR, any_of(pcb_list), PCB, "Dioxin-like", "Non-dioxin-like")
+
+axys_pops_panc_rm_389_pcb <- axys_pops_with_sums_panc %>%
+  dplyr::filter(DONOR != "R389") %>%
+  dplyr::select(DONOR, any_of(pcb_list), PCB, "Dioxin-like", "Non-dioxin-like")
+
+axys_pops_panc_rm_419_pcb <- axys_pops_with_sums_panc %>%
+  dplyr::filter(DONOR != "R419") %>%
+  dplyr::select(DONOR, any_of(pcb_list), PCB, "Dioxin-like", "Non-dioxin-like")
+
+axys_pops_panc_rm_448_pcb <- axys_pops_with_sums_panc %>%
+  dplyr::filter(DONOR != "R448") %>%
+  dplyr::select(DONOR, any_of(pcb_list), PCB, "Dioxin-like", "Non-dioxin-like")
+
+# Adipose
+axys_pops_adip_pcb <- axys_pops_with_sums_adip %>%
+  dplyr::select(DONOR, any_of(pcb_list), PCB, "Dioxin-like", "Non-dioxin-like")
+
+axys_pops_adip_pcb_imp <- axys_pops_with_sums_adip_imp %>%
+  dplyr::select(DONOR, any_of(pcb_list), PCB, "Dioxin-like", "Non-dioxin-like")
+
+axys_pops_adip_rm_ind_pcb <- axys_pops_with_sums_adip %>%
+  dplyr::filter(!(DONOR %in% rm_ind_adip)) %>%
+  dplyr::select(DONOR, any_of(pcb_list), PCB, "Dioxin-like", "Non-dioxin-like")
+
+axys_pops_adip_rm_419_pcb <- axys_pops_with_sums_adip %>%
+  dplyr::filter(DONOR != "R419") %>%
+  dplyr::select(DONOR, any_of(pcb_list), PCB, "Dioxin-like", "Non-dioxin-like")
+
+axys_pops_adip_rm_421_pcb <- axys_pops_with_sums_adip %>%
+  dplyr::filter(DONOR != "R421") %>%
+  dplyr::select(DONOR, any_of(pcb_list), PCB, "Dioxin-like", "Non-dioxin-like")
+```
+
+```{r}
+## OCPs
+
+# Pancreas
+axys_pops_panc_ocp <- axys_pops_with_sums_panc %>%
+  dplyr::select(DONOR, any_of(ocp_list))
+
+axys_pops_panc_ocp_imp <- axys_pops_with_sums_panc_imp %>%
+  dplyr::select(DONOR, any_of(ocp_list))
+
+axys_pops_panc_rm_ind_ocp <- axys_pops_with_sums_panc %>%
+  dplyr::filter(!(DONOR %in% rm_ind_panc)) %>%
+  dplyr::select(DONOR, any_of(ocp_list))
+
+axys_pops_panc_rm_389_ocp <- axys_pops_with_sums_panc %>%
+  dplyr::filter(DONOR != "R389") %>%
+  dplyr::select(DONOR, any_of(ocp_list))
+
+axys_pops_panc_rm_419_ocp <- axys_pops_with_sums_panc %>%
+  dplyr::filter(DONOR != "R419") %>%
+  dplyr::select(DONOR, any_of(ocp_list))
+
+axys_pops_panc_rm_448_ocp <- axys_pops_with_sums_panc %>%
+  dplyr::filter(DONOR != "R448") %>%
+  dplyr::select(DONOR, any_of(ocp_list))
+
+# Adipose
+axys_pops_adip_ocp <- axys_pops_with_sums_adip %>%
+  dplyr::select(DONOR, any_of(ocp_list))
+
+axys_pops_adip_ocp_imp <- axys_pops_with_sums_adip_imp %>%
+  dplyr::select(DONOR, any_of(ocp_list))
+
+axys_pops_adip_rm_ind_ocp <- axys_pops_with_sums_adip %>%
+  dplyr::filter(!(DONOR %in% rm_ind_adip)) %>%
+  dplyr::select(DONOR, any_of(ocp_list))
+
+axys_pops_adip_rm_419_ocp <- axys_pops_with_sums_adip %>%
+  dplyr::filter(DONOR != "R419") %>%
+  dplyr::select(DONOR, any_of(ocp_list))
+
+axys_pops_adip_rm_421_ocp <- axys_pops_with_sums_adip %>%
+  dplyr::filter(DONOR != "R421") %>%
+  dplyr::select(DONOR, any_of(ocp_list))
+```
+
+## Combine analyte concentrations with GSIS data
+
+```{r}
+# Pancreas dioxins (initial)
+axys_pops_panc_dioxin_core <- axys_pops_panc_dioxin %>%
+  left_join(., gsis_adi, by = c("DONOR" = "Donor"))
+
+axys_pops_panc_dioxin_jk_glu <- axys_pops_panc_dioxin %>%
+  left_join(., glu_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_panc_dioxin_jk_leu <- axys_pops_panc_dioxin %>%
+  left_join(., leu_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_panc_dioxin_jk_fa <- axys_pops_panc_dioxin %>%
+  left_join(., fa_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_panc_dioxin_mh_glu <- axys_pops_panc_dioxin %>%
+  left_join(., glu_peri_mh_t, by = c("DONOR" = "Donor")) %>%
+  dplyr::mutate(across(2:ncol(.), as.numeric))
+
+# Pancreas dioxins (imputed missing values)
+axys_pops_panc_dioxin_imp_core <- axys_pops_panc_dioxin_imp %>%
+  left_join(., gsis_adi, by = c("DONOR" = "Donor"))
+
+axys_pops_panc_dioxin_imp_jk_glu <- axys_pops_panc_dioxin_imp %>%
+  left_join(., glu_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_panc_dioxin_imp_jk_leu <- axys_pops_panc_dioxin_imp %>%
+  left_join(., leu_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_panc_dioxin_imp_jk_fa <- axys_pops_panc_dioxin_imp %>%
+  left_join(., fa_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_panc_dioxin_imp_mh_glu <- axys_pops_panc_dioxin_imp %>%
+  left_join(., glu_peri_mh_t, by = c("DONOR" = "Donor")) %>%
+  dplyr::mutate(across(2:ncol(.), as.numeric))
+
+# Pancreas dioxins (removed all outliers)
+axys_pops_panc_dioxin_rm_ind_core <- axys_pops_panc_rm_ind_dioxin %>%
+  left_join(., gsis_adi, by = c("DONOR" = "Donor"))
+
+axys_pops_panc_dioxin_rm_ind_jk_glu <- axys_pops_panc_rm_ind_dioxin %>%
+  left_join(., glu_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_panc_dioxin_rm_ind_jk_leu <- axys_pops_panc_rm_ind_dioxin %>%
+  left_join(., leu_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_panc_dioxin_rm_ind_jk_fa <- axys_pops_panc_rm_ind_dioxin %>%
+  left_join(., fa_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_panc_dioxin_rm_ind_mh_glu <- axys_pops_panc_rm_ind_dioxin %>%
+  left_join(., glu_peri_mh_t, by = c("DONOR" = "Donor")) %>%
+  dplyr::mutate(across(2:ncol(.), as.numeric))
+
+# Pancreas dioxins (removed R389)
+axys_pops_panc_dioxin_rm_389_core <- axys_pops_panc_rm_389_dioxin %>%
+  left_join(., gsis_adi, by = c("DONOR" = "Donor"))
+
+axys_pops_panc_dioxin_rm_389_jk_glu <- axys_pops_panc_rm_389_dioxin %>%
+  left_join(., glu_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_panc_dioxin_rm_389_jk_leu <- axys_pops_panc_rm_389_dioxin %>%
+  left_join(., leu_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_panc_dioxin_rm_389_jk_fa <- axys_pops_panc_rm_389_dioxin %>%
+  left_join(., fa_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_panc_dioxin_rm_389_mh_glu <- axys_pops_panc_rm_389_dioxin %>%
+  left_join(., glu_peri_mh_t, by = c("DONOR" = "Donor")) %>%
+  dplyr::mutate(across(2:ncol(.), as.numeric))
+
+# Pancreas dioxins (removed R419)
+axys_pops_panc_dioxin_rm_419_core <- axys_pops_panc_rm_419_dioxin %>%
+  left_join(., gsis_adi, by = c("DONOR" = "Donor"))
+
+axys_pops_panc_dioxin_rm_419_jk_glu <- axys_pops_panc_rm_419_dioxin %>%
+  left_join(., glu_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_panc_dioxin_rm_419_jk_leu <- axys_pops_panc_rm_419_dioxin %>%
+  left_join(., leu_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_panc_dioxin_rm_419_jk_fa <- axys_pops_panc_rm_419_dioxin %>%
+  left_join(., fa_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_panc_dioxin_rm_419_mh_glu <- axys_pops_panc_rm_419_dioxin %>%
+  left_join(., glu_peri_mh_t, by = c("DONOR" = "Donor")) %>%
+  dplyr::mutate(across(2:ncol(.), as.numeric))
+
+# Pancreas dioxins (removed R448)
+axys_pops_panc_dioxin_rm_448_core <- axys_pops_panc_rm_448_dioxin %>%
+  left_join(., gsis_adi, by = c("DONOR" = "Donor"))
+
+axys_pops_panc_dioxin_rm_448_jk_glu <- axys_pops_panc_rm_448_dioxin %>%
+  left_join(., glu_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_panc_dioxin_rm_448_jk_leu <- axys_pops_panc_rm_448_dioxin %>%
+  left_join(., leu_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_panc_dioxin_rm_448_jk_fa <- axys_pops_panc_rm_448_dioxin %>%
+  left_join(., fa_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_panc_dioxin_rm_448_mh_glu <- axys_pops_panc_rm_448_dioxin %>%
+  left_join(., glu_peri_mh_t, by = c("DONOR" = "Donor")) %>%
+  dplyr::mutate(across(2:ncol(.), as.numeric))
+```
+
+```{r}
+# Pancreas PCBs (initial)
+axys_pops_panc_pcb_core <- axys_pops_panc_pcb %>%
+  left_join(., gsis_adi, by = c("DONOR" = "Donor"))
+
+axys_pops_panc_pcb_jk_glu <- axys_pops_panc_pcb %>%
+  left_join(., glu_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_panc_pcb_jk_leu <- axys_pops_panc_pcb %>%
+  left_join(., leu_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_panc_pcb_jk_fa <- axys_pops_panc_pcb %>%
+  left_join(., fa_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_panc_pcb_mh_glu <- axys_pops_panc_pcb %>%
+  left_join(., glu_peri_mh_t, by = c("DONOR" = "Donor")) %>%
+  dplyr::mutate(across(2:ncol(.), as.numeric))
+
+# Pancreas PCBs (imputed missing values)
+axys_pops_panc_pcb_imp_core <- axys_pops_panc_pcb_imp %>%
+  left_join(., gsis_adi, by = c("DONOR" = "Donor"))
+
+axys_pops_panc_pcb_imp_jk_glu <- axys_pops_panc_pcb_imp %>%
+  left_join(., glu_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_panc_pcb_imp_jk_leu <- axys_pops_panc_pcb_imp %>%
+  left_join(., leu_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_panc_pcb_imp_jk_fa <- axys_pops_panc_pcb_imp %>%
+  left_join(., fa_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_panc_pcb_imp_mh_glu <- axys_pops_panc_pcb_imp %>%
+  left_join(., glu_peri_mh_t, by = c("DONOR" = "Donor")) %>%
+  dplyr::mutate(across(2:ncol(.), as.numeric))
+
+# Pancreas PCBs (removed all outliers)
+axys_pops_panc_pcb_rm_ind_core <- axys_pops_panc_rm_ind_pcb %>%
+  left_join(., gsis_adi, by = c("DONOR" = "Donor"))
+
+axys_pops_panc_pcb_rm_ind_jk_glu <- axys_pops_panc_rm_ind_pcb %>%
+  left_join(., glu_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_panc_pcb_rm_ind_jk_leu <- axys_pops_panc_rm_ind_pcb %>%
+  left_join(., leu_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_panc_pcb_rm_ind_jk_fa <- axys_pops_panc_rm_ind_pcb %>%
+  left_join(., fa_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_panc_pcb_rm_ind_mh_glu <- axys_pops_panc_rm_ind_pcb %>%
+  left_join(., glu_peri_mh_t, by = c("DONOR" = "Donor")) %>%
+  dplyr::mutate(across(2:ncol(.), as.numeric))
+
+# Pancreas PCBs (removed R389)
+axys_pops_panc_pcb_rm_389_core <- axys_pops_panc_rm_389_pcb %>%
+  left_join(., gsis_adi, by = c("DONOR" = "Donor"))
+
+axys_pops_panc_pcb_rm_389_jk_glu <- axys_pops_panc_rm_389_pcb %>%
+  left_join(., glu_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_panc_pcb_rm_389_jk_leu <- axys_pops_panc_rm_389_pcb %>%
+  left_join(., leu_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_panc_pcb_rm_389_jk_fa <- axys_pops_panc_rm_389_pcb %>%
+  left_join(., fa_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_panc_pcb_rm_389_mh_glu <- axys_pops_panc_rm_389_pcb %>%
+  left_join(., glu_peri_mh_t, by = c("DONOR" = "Donor")) %>%
+  dplyr::mutate(across(2:ncol(.), as.numeric))
+
+# Pancreas PCB (removed R419)
+axys_pops_panc_pcb_rm_419_core <- axys_pops_panc_rm_419_pcb %>%
+  left_join(., gsis_adi, by = c("DONOR" = "Donor"))
+
+axys_pops_panc_pcb_rm_419_jk_glu <- axys_pops_panc_rm_419_pcb %>%
+  left_join(., glu_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_panc_pcb_rm_419_jk_leu <- axys_pops_panc_rm_419_pcb %>%
+  left_join(., leu_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_panc_pcb_rm_419_jk_fa <- axys_pops_panc_rm_419_pcb %>%
+  left_join(., fa_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_panc_pcb_rm_419_mh_glu <- axys_pops_panc_rm_419_pcb %>%
+  left_join(., glu_peri_mh_t, by = c("DONOR" = "Donor")) %>%
+  dplyr::mutate(across(2:ncol(.), as.numeric))
+
+# Pancreas PCBs (removed R448)
+axys_pops_panc_pcb_rm_448_core <- axys_pops_panc_rm_448_pcb %>%
+  left_join(., gsis_adi, by = c("DONOR" = "Donor"))
+
+axys_pops_panc_pcb_rm_448_jk_glu <- axys_pops_panc_rm_448_pcb %>%
+  left_join(., glu_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_panc_pcb_rm_448_jk_leu <- axys_pops_panc_rm_448_pcb %>%
+  left_join(., leu_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_panc_pcb_rm_448_jk_fa <- axys_pops_panc_rm_448_pcb %>%
+  left_join(., fa_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_panc_pcb_rm_448_mh_glu <- axys_pops_panc_rm_448_pcb %>%
+  left_join(., glu_peri_mh_t, by = c("DONOR" = "Donor")) %>%
+  dplyr::mutate(across(2:ncol(.), as.numeric))
+```
+
+```{r}
+# Pancreas OCPs (initial)
+axys_pops_panc_ocp_core <- axys_pops_panc_ocp %>%
+  left_join(., gsis_adi, by = c("DONOR" = "Donor"))
+
+axys_pops_panc_ocp_jk_glu <- axys_pops_panc_ocp %>%
+  left_join(., glu_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_panc_ocp_jk_leu <- axys_pops_panc_ocp %>%
+  left_join(., leu_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_panc_ocp_jk_fa <- axys_pops_panc_ocp %>%
+  left_join(., fa_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_panc_ocp_mh_glu <- axys_pops_panc_ocp %>%
+  left_join(., glu_peri_mh_t, by = c("DONOR" = "Donor")) %>%
+  dplyr::mutate(across(2:ncol(.), as.numeric))
+
+# Pancreas OCPs (imputed missing values)
+axys_pops_panc_ocp_imp_core <- axys_pops_panc_ocp_imp %>%
+  left_join(., gsis_adi, by = c("DONOR" = "Donor"))
+
+axys_pops_panc_ocp_imp_jk_glu <- axys_pops_panc_ocp_imp %>%
+  left_join(., glu_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_panc_ocp_imp_jk_leu <- axys_pops_panc_ocp_imp %>%
+  left_join(., leu_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_panc_ocp_imp_jk_fa <- axys_pops_panc_ocp_imp %>%
+  left_join(., fa_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_panc_ocp_imp_mh_glu <- axys_pops_panc_ocp_imp %>%
+  left_join(., glu_peri_mh_t, by = c("DONOR" = "Donor")) %>%
+  dplyr::mutate(across(2:ncol(.), as.numeric))
+
+# Pancreas OCPs (removed all outliers)
+axys_pops_panc_ocp_rm_ind_core <- axys_pops_panc_rm_ind_ocp %>%
+  left_join(., gsis_adi, by = c("DONOR" = "Donor"))
+
+axys_pops_panc_ocp_rm_ind_jk_glu <- axys_pops_panc_rm_ind_ocp %>%
+  left_join(., glu_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_panc_ocp_rm_ind_jk_leu <- axys_pops_panc_rm_ind_ocp %>%
+  left_join(., leu_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_panc_ocp_rm_ind_jk_fa <- axys_pops_panc_rm_ind_ocp %>%
+  left_join(., fa_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_panc_ocp_rm_ind_mh_glu <- axys_pops_panc_rm_ind_ocp %>%
+  left_join(., glu_peri_mh_t, by = c("DONOR" = "Donor")) %>%
+  dplyr::mutate(across(2:ncol(.), as.numeric))
+
+# Pancreas OCPs (removed R389)
+axys_pops_panc_ocp_rm_389_core <- axys_pops_panc_rm_389_ocp %>%
+  left_join(., gsis_adi, by = c("DONOR" = "Donor"))
+
+axys_pops_panc_ocp_rm_389_jk_glu <- axys_pops_panc_rm_389_ocp %>%
+  left_join(., glu_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_panc_ocp_rm_389_jk_leu <- axys_pops_panc_rm_389_ocp %>%
+  left_join(., leu_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_panc_ocp_rm_389_jk_fa <- axys_pops_panc_rm_389_ocp %>%
+  left_join(., fa_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_panc_ocp_rm_389_mh_glu <- axys_pops_panc_rm_389_ocp %>%
+  left_join(., glu_peri_mh_t, by = c("DONOR" = "Donor")) %>%
+  dplyr::mutate(across(2:ncol(.), as.numeric))
+
+# Pancreas OCPs (removed R419)
+axys_pops_panc_ocp_rm_419_core <- axys_pops_panc_rm_419_ocp %>%
+  left_join(., gsis_adi, by = c("DONOR" = "Donor"))
+
+axys_pops_panc_ocp_rm_419_jk_glu <- axys_pops_panc_rm_419_ocp %>%
+  left_join(., glu_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_panc_ocp_rm_419_jk_leu <- axys_pops_panc_rm_419_ocp %>%
+  left_join(., leu_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_panc_ocp_rm_419_jk_fa <- axys_pops_panc_rm_419_ocp %>%
+  left_join(., fa_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_panc_ocp_rm_419_mh_glu <- axys_pops_panc_rm_419_ocp %>%
+  left_join(., glu_peri_mh_t, by = c("DONOR" = "Donor")) %>%
+  dplyr::mutate(across(2:ncol(.), as.numeric))
+
+# Pancreas OCPs (removed R448)
+axys_pops_panc_ocp_rm_448_core <- axys_pops_panc_rm_448_ocp %>%
+  left_join(., gsis_adi, by = c("DONOR" = "Donor"))
+
+axys_pops_panc_ocp_rm_448_jk_glu <- axys_pops_panc_rm_448_ocp %>%
+  left_join(., glu_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_panc_ocp_rm_448_jk_leu <- axys_pops_panc_rm_448_ocp %>%
+  left_join(., leu_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_panc_ocp_rm_448_jk_fa <- axys_pops_panc_rm_448_ocp %>%
+  left_join(., fa_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_panc_ocp_rm_448_mh_glu <- axys_pops_panc_rm_448_ocp %>%
+  left_join(., glu_peri_mh_t, by = c("DONOR" = "Donor")) %>%
+  dplyr::mutate(across(2:ncol(.), as.numeric))
+```
+
+```{r}
+# Adipose dioxins (initial)
+axys_pops_adip_dioxin_core <- axys_pops_adip_dioxin %>%
+  left_join(., gsis_adi, by = c("DONOR" = "Donor"))
+
+axys_pops_adip_dioxin_jk_glu <- axys_pops_adip_dioxin %>%
+  left_join(., glu_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_adip_dioxin_jk_leu <- axys_pops_adip_dioxin %>%
+  left_join(., leu_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_adip_dioxin_jk_fa <- axys_pops_adip_dioxin %>%
+  left_join(., fa_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_adip_dioxin_mh_glu <- axys_pops_adip_dioxin %>%
+  left_join(., glu_peri_mh_t, by = c("DONOR" = "Donor")) %>%
+  dplyr::mutate(across(2:ncol(.), as.numeric))
+
+# Adipose dioxins (imputed missing values)
+axys_pops_adip_dioxin_imp_core <- axys_pops_adip_dioxin_imp %>%
+  left_join(., gsis_adi, by = c("DONOR" = "Donor"))
+
+axys_pops_adip_dioxin_imp_jk_glu <- axys_pops_adip_dioxin_imp %>%
+  left_join(., glu_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_adip_dioxin_imp_jk_leu <- axys_pops_adip_dioxin_imp %>%
+  left_join(., leu_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_adip_dioxin_imp_jk_fa <- axys_pops_adip_dioxin_imp %>%
+  left_join(., fa_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_adip_dioxin_imp_mh_glu <- axys_pops_adip_dioxin_imp %>%
+  left_join(., glu_peri_mh_t, by = c("DONOR" = "Donor")) %>%
+  dplyr::mutate(across(2:ncol(.), as.numeric))
+
+# Adipose dioxins (removed all outliers)
+axys_pops_adip_dioxin_rm_ind_core <- axys_pops_adip_rm_ind_dioxin %>%
+  left_join(., gsis_adi, by = c("DONOR" = "Donor"))
+
+axys_pops_adip_dioxin_rm_ind_jk_glu <- axys_pops_adip_rm_ind_dioxin %>%
+  left_join(., glu_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_adip_dioxin_rm_ind_jk_leu <- axys_pops_adip_rm_ind_dioxin %>%
+  left_join(., leu_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_adip_dioxin_rm_ind_jk_fa <- axys_pops_adip_rm_ind_dioxin %>%
+  left_join(., fa_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_adip_dioxin_rm_ind_mh_glu <- axys_pops_adip_rm_ind_dioxin %>%
+  left_join(., glu_peri_mh_t, by = c("DONOR" = "Donor")) %>%
+  dplyr::mutate(across(2:ncol(.), as.numeric))
+
+# Adipose dioxins (removed R419)
+axys_pops_adip_dioxin_rm_419_core <- axys_pops_adip_rm_419_dioxin %>%
+  left_join(., gsis_adi, by = c("DONOR" = "Donor"))
+
+axys_pops_adip_dioxin_rm_419_jk_glu <- axys_pops_adip_rm_419_dioxin %>%
+  left_join(., glu_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_adip_dioxin_rm_419_jk_leu <- axys_pops_adip_rm_419_dioxin %>%
+  left_join(., leu_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_adip_dioxin_rm_419_jk_fa <- axys_pops_adip_rm_419_dioxin %>%
+  left_join(., fa_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_adip_dioxin_rm_419_mh_glu <- axys_pops_adip_rm_419_dioxin %>%
+  left_join(., glu_peri_mh_t, by = c("DONOR" = "Donor")) %>%
+  dplyr::mutate(across(2:ncol(.), as.numeric))
+
+# Adipose dioxins (removed R421)
+axys_pops_adip_dioxin_rm_421_core <- axys_pops_adip_rm_421_dioxin %>%
+  left_join(., gsis_adi, by = c("DONOR" = "Donor"))
+
+axys_pops_adip_dioxin_rm_421_jk_glu <- axys_pops_adip_rm_421_dioxin %>%
+  left_join(., glu_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_adip_dioxin_rm_421_jk_leu <- axys_pops_adip_rm_421_dioxin %>%
+  left_join(., leu_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_adip_dioxin_rm_421_jk_fa <- axys_pops_adip_rm_421_dioxin %>%
+  left_join(., fa_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_adip_dioxin_rm_421_mh_glu <- axys_pops_adip_rm_421_dioxin %>%
+  left_join(., glu_peri_mh_t, by = c("DONOR" = "Donor")) %>%
+  dplyr::mutate(across(2:ncol(.), as.numeric))
+```
+
+```{r}
+# Adipose PCBs (initial)
+axys_pops_adip_pcb_core <- axys_pops_adip_pcb %>%
+  left_join(., gsis_adi, by = c("DONOR" = "Donor"))
+
+axys_pops_adip_pcb_jk_glu <- axys_pops_adip_pcb %>%
+  left_join(., glu_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_adip_pcb_jk_leu <- axys_pops_adip_pcb %>%
+  left_join(., leu_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_adip_pcb_jk_fa <- axys_pops_adip_pcb %>%
+  left_join(., fa_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_adip_pcb_mh_glu <- axys_pops_adip_pcb %>%
+  left_join(., glu_peri_mh_t, by = c("DONOR" = "Donor")) %>%
+  dplyr::mutate(across(2:ncol(.), as.numeric))
+
+# Adipose PCBs (imputed missing values)
+axys_pops_adip_pcb_imp_core <- axys_pops_adip_pcb_imp %>%
+  left_join(., gsis_adi, by = c("DONOR" = "Donor"))
+
+axys_pops_adip_pcb_imp_jk_glu <- axys_pops_adip_pcb_imp %>%
+  left_join(., glu_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_adip_pcb_imp_jk_leu <- axys_pops_adip_pcb_imp %>%
+  left_join(., leu_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_adip_pcb_imp_jk_fa <- axys_pops_adip_pcb_imp %>%
+  left_join(., fa_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_adip_pcb_imp_mh_glu <- axys_pops_adip_pcb_imp %>%
+  left_join(., glu_peri_mh_t, by = c("DONOR" = "Donor")) %>%
+  dplyr::mutate(across(2:ncol(.), as.numeric))
+
+# Adipose PCBs (removed all outliers)
+axys_pops_adip_pcb_rm_ind_core <- axys_pops_adip_rm_ind_pcb %>%
+  left_join(., gsis_adi, by = c("DONOR" = "Donor"))
+
+axys_pops_adip_pcb_rm_ind_jk_glu <- axys_pops_adip_rm_ind_pcb %>%
+  left_join(., glu_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_adip_pcb_rm_ind_jk_leu <- axys_pops_adip_rm_ind_pcb %>%
+  left_join(., leu_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_adip_pcb_rm_ind_jk_fa <- axys_pops_adip_rm_ind_pcb %>%
+  left_join(., fa_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_adip_pcb_rm_ind_mh_glu <- axys_pops_adip_rm_ind_pcb %>%
+  left_join(., glu_peri_mh_t, by = c("DONOR" = "Donor")) %>%
+  dplyr::mutate(across(2:ncol(.), as.numeric))
+
+# Adipose PCBs (removed R419)
+axys_pops_adip_pcb_rm_419_core <- axys_pops_adip_rm_419_pcb %>%
+  left_join(., gsis_adi, by = c("DONOR" = "Donor"))
+
+axys_pops_adip_pcb_rm_419_jk_glu <- axys_pops_adip_rm_419_pcb %>%
+  left_join(., glu_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_adip_pcb_rm_419_jk_leu <- axys_pops_adip_rm_419_pcb %>%
+  left_join(., leu_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_adip_pcb_rm_419_jk_fa <- axys_pops_adip_rm_419_pcb %>%
+  left_join(., fa_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_adip_pcb_rm_419_mh_glu <- axys_pops_adip_rm_419_pcb %>%
+  left_join(., glu_peri_mh_t, by = c("DONOR" = "Donor")) %>%
+  dplyr::mutate(across(2:ncol(.), as.numeric))
+
+# Adipose PCBs (removed R421)
+axys_pops_adip_pcb_rm_421_core <- axys_pops_adip_rm_421_pcb %>%
+  left_join(., gsis_adi, by = c("DONOR" = "Donor"))
+
+axys_pops_adip_pcb_rm_421_jk_glu <- axys_pops_adip_rm_421_pcb %>%
+  left_join(., glu_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_adip_pcb_rm_421_jk_leu <- axys_pops_adip_rm_421_pcb %>%
+  left_join(., leu_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_adip_pcb_rm_421_jk_fa <- axys_pops_adip_rm_421_pcb %>%
+  left_join(., fa_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_adip_pcb_rm_421_mh_glu <- axys_pops_adip_rm_421_pcb %>%
+  left_join(., glu_peri_mh_t, by = c("DONOR" = "Donor")) %>%
+  dplyr::mutate(across(2:ncol(.), as.numeric))
+```
+
+```{r}
+# Adipose OCPs (initial)
+axys_pops_adip_ocp_core <- axys_pops_adip_ocp %>%
+  left_join(., gsis_adi, by = c("DONOR" = "Donor"))
+
+axys_pops_adip_ocp_jk_glu <- axys_pops_adip_ocp %>%
+  left_join(., glu_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_adip_ocp_jk_leu <- axys_pops_adip_ocp %>%
+  left_join(., leu_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_adip_ocp_jk_fa <- axys_pops_adip_ocp %>%
+  left_join(., fa_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_adip_ocp_mh_glu <- axys_pops_adip_ocp %>%
+  left_join(., glu_peri_mh_t, by = c("DONOR" = "Donor")) %>%
+  dplyr::mutate(across(2:ncol(.), as.numeric))
+
+# Adipose OCPs (imputed missing values)
+axys_pops_adip_ocp_imp_core <- axys_pops_adip_ocp_imp %>%
+  left_join(., gsis_adi, by = c("DONOR" = "Donor"))
+
+axys_pops_adip_ocp_imp_jk_glu <- axys_pops_adip_ocp_imp %>%
+  left_join(., glu_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_adip_ocp_imp_jk_leu <- axys_pops_adip_ocp_imp %>%
+  left_join(., leu_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_adip_ocp_imp_jk_fa <- axys_pops_adip_ocp_imp %>%
+  left_join(., fa_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_adip_ocp_imp_mh_glu <- axys_pops_adip_ocp_imp %>%
+  left_join(., glu_peri_mh_t, by = c("DONOR" = "Donor")) %>%
+  dplyr::mutate(across(2:ncol(.), as.numeric))
+
+# Adipose OCPs (removed all outliers)
+axys_pops_adip_ocp_rm_ind_core <- axys_pops_adip_rm_ind_ocp %>%
+  left_join(., gsis_adi, by = c("DONOR" = "Donor"))
+
+axys_pops_adip_ocp_rm_ind_jk_glu <- axys_pops_adip_rm_ind_ocp %>%
+  left_join(., glu_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_adip_ocp_rm_ind_jk_leu <- axys_pops_adip_rm_ind_ocp %>%
+  left_join(., leu_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_adip_ocp_rm_ind_jk_fa <- axys_pops_adip_rm_ind_ocp %>%
+  left_join(., fa_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_adip_ocp_rm_ind_mh_glu <- axys_pops_adip_rm_ind_ocp %>%
+  left_join(., glu_peri_mh_t, by = c("DONOR" = "Donor")) %>%
+  dplyr::mutate(across(2:ncol(.), as.numeric))
+
+# Adipose OCPs (removed R419)
+axys_pops_adip_ocp_rm_419_core <- axys_pops_adip_rm_419_ocp %>%
+  left_join(., gsis_adi, by = c("DONOR" = "Donor"))
+
+axys_pops_adip_ocp_rm_419_jk_glu <- axys_pops_adip_rm_419_ocp %>%
+  left_join(., glu_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_adip_ocp_rm_419_jk_leu <- axys_pops_adip_rm_419_ocp %>%
+  left_join(., leu_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_adip_ocp_rm_419_jk_fa <- axys_pops_adip_rm_419_ocp %>%
+  left_join(., fa_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_adip_ocp_rm_419_mh_glu <- axys_pops_adip_rm_419_ocp %>%
+  left_join(., glu_peri_mh_t, by = c("DONOR" = "Donor")) %>%
+  dplyr::mutate(across(2:ncol(.), as.numeric))
+
+# Adipose OCPs (removed R421)
+axys_pops_adip_ocp_rm_421_core <- axys_pops_adip_rm_421_ocp %>%
+  left_join(., gsis_adi, by = c("DONOR" = "Donor"))
+
+axys_pops_adip_ocp_rm_421_jk_glu <- axys_pops_adip_rm_421_ocp %>%
+  left_join(., glu_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_adip_ocp_rm_421_jk_leu <- axys_pops_adip_rm_421_ocp %>%
+  left_join(., leu_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_adip_ocp_rm_421_jk_fa <- axys_pops_adip_rm_421_ocp %>%
+  left_join(., fa_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_pops_adip_ocp_rm_421_mh_glu <- axys_pops_adip_rm_421_ocp %>%
+  left_join(., glu_peri_mh_t, by = c("DONOR" = "Donor")) %>%
+  dplyr::mutate(across(2:ncol(.), as.numeric))
+```
+
+## Correlate analyte concentrations with functional parameters
+
+```{r}
+# Pancreas - original data (no imputations or donors removed)
+axys_pops_with_sums_panc_core_gsis_orig_list <- list(
+  axys_pops_panc_dioxin_core = axys_pops_panc_dioxin_core,
+  axys_pops_panc_pcb_core = axys_pops_panc_pcb_core,
+  axys_pops_panc_ocp_core = axys_pops_panc_ocp_core
+)
+
+axys_pops_with_sums_panc_jk_glu_gsis_orig_list <- list(
+  axys_pops_panc_dioxin_jk_glu = axys_pops_panc_dioxin_jk_glu,
+  axys_pops_panc_pcb_jk_glu = axys_pops_panc_pcb_jk_glu,
+  axys_pops_panc_ocp_jk_glu = axys_pops_panc_ocp_jk_glu
+)
+
+axys_pops_with_sums_panc_jk_leu_gsis_orig_list <- list(
+  axys_pops_panc_dioxin_jk_leu = axys_pops_panc_dioxin_jk_leu,
+  axys_pops_panc_pcb_jk_leu = axys_pops_panc_pcb_jk_leu,
+  axys_pops_panc_ocp_jk_leu = axys_pops_panc_ocp_jk_leu
+)
+
+axys_pops_with_sums_panc_jk_fa_gsis_orig_list <- list(
+  axys_pops_panc_dioxin_jk_fa = axys_pops_panc_dioxin_jk_fa,
+  axys_pops_panc_pcb_jk_fa = axys_pops_panc_pcb_jk_fa,
+  axys_pops_panc_ocp_jk_fa = axys_pops_panc_ocp_jk_fa
+)
+
+axys_pops_with_sums_panc_mh_glu_gsis_orig_list <- list(
+  axys_pops_panc_dioxin_mh_glu = axys_pops_panc_dioxin_mh_glu,
+  axys_pops_panc_pcb_mh_glu = axys_pops_panc_pcb_mh_glu,
+  axys_pops_panc_ocp_mh_glu = axys_pops_panc_ocp_mh_glu
+)
+```
+
+```{r}
+# Pancreas - with imputations
+axys_pops_with_sums_panc_core_gsis_imputed_list <- list(
+  axys_pops_panc_dioxin_imp_core = axys_pops_panc_dioxin_imp_core,
+  axys_pops_panc_pcb_imp_core = axys_pops_panc_pcb_imp_core,
+  axys_pops_panc_ocp_imp_core = axys_pops_panc_ocp_imp_core
+)
+
+axys_pops_with_sums_panc_jk_glu_gsis_imputed_list <- list(
+  axys_pops_panc_dioxin_imp_jk_glu = axys_pops_panc_dioxin_imp_jk_glu,
+  axys_pops_panc_pcb_imp_jk_glu = axys_pops_panc_pcb_imp_jk_glu,
+  axys_pops_panc_ocp_imp_jk_glu = axys_pops_panc_ocp_imp_jk_glu
+)
+
+axys_pops_with_sums_panc_jk_leu_gsis_imputed_list <- list(
+  axys_pops_panc_dioxin_imp_jk_leu = axys_pops_panc_dioxin_imp_jk_leu,
+  axys_pops_panc_pcb_imp_jk_leu = axys_pops_panc_pcb_imp_jk_leu,
+  axys_pops_panc_ocp_imp_jk_leu = axys_pops_panc_ocp_imp_jk_leu
+)
+
+axys_pops_with_sums_panc_jk_fa_gsis_imputed_list <- list(
+  axys_pops_panc_dioxin_imp_jk_fa = axys_pops_panc_dioxin_imp_jk_fa,
+  axys_pops_panc_pcb_imp_jk_fa = axys_pops_panc_pcb_imp_jk_fa,
+  axys_pops_panc_ocp_imp_jk_fa = axys_pops_panc_ocp_imp_jk_fa
+)
+
+axys_pops_with_sums_panc_mh_glu_gsis_imputed_list <- list(
+  axys_pops_panc_dioxin_imp_mh_glu = axys_pops_panc_dioxin_imp_mh_glu,
+  axys_pops_panc_pcb_imp_mh_glu = axys_pops_panc_pcb_imp_mh_glu,
+  axys_pops_panc_ocp_imp_mh_glu = axys_pops_panc_ocp_imp_mh_glu
+)
+```
+
+```{r}
+# Pancreas - removed ALL outlier donors
+axys_pops_with_sums_panc_core_gsis_rm_outliers_list <- list(
+  axys_pops_panc_dioxin_rm_ind_core = axys_pops_panc_dioxin_rm_ind_core,
+  axys_pops_panc_pcb_rm_ind_core = axys_pops_panc_pcb_rm_ind_core,
+  axys_pops_panc_ocp_rm_ind_core = axys_pops_panc_ocp_rm_ind_core
+)
+
+axys_pops_with_sums_panc_jk_glu_gsis_rm_outliers_list <- list(
+  axys_pops_panc_dioxin_rm_ind_jk_glu = axys_pops_panc_dioxin_rm_ind_jk_glu,
+  axys_pops_panc_pcb_rm_ind_jk_glu = axys_pops_panc_pcb_rm_ind_jk_glu,
+  axys_pops_panc_ocp_rm_ind_jk_glu = axys_pops_panc_ocp_rm_ind_jk_glu
+)
+
+axys_pops_with_sums_panc_jk_leu_gsis_rm_outliers_list <- list(
+  axys_pops_panc_dioxin_rm_ind_jk_leu = axys_pops_panc_dioxin_rm_ind_jk_leu,
+  axys_pops_panc_pcb_rm_ind_jk_leu = axys_pops_panc_pcb_rm_ind_jk_leu,
+  axys_pops_panc_ocp_rm_ind_jk_leu = axys_pops_panc_ocp_rm_ind_jk_leu
+)
+
+axys_pops_with_sums_panc_jk_fa_gsis_rm_outliers_list <- list(
+  axys_pops_panc_dioxin_rm_ind_jk_fa = axys_pops_panc_dioxin_rm_ind_jk_fa,
+  axys_pops_panc_pcb_rm_ind_jk_fa = axys_pops_panc_pcb_rm_ind_jk_fa,
+  axys_pops_panc_ocp_rm_ind_jk_fa = axys_pops_panc_ocp_rm_ind_jk_fa
+)
+
+axys_pops_with_sums_panc_mh_glu_gsis_rm_outliers_list <- list(
+  axys_pops_panc_dioxin_rm_ind_mh_glu = axys_pops_panc_dioxin_rm_ind_mh_glu,
+  axys_pops_panc_pcb_rm_ind_mh_glu = axys_pops_panc_pcb_rm_ind_mh_glu,
+  axys_pops_panc_ocp_rm_ind_mh_glu = axys_pops_panc_ocp_rm_ind_mh_glu
+)
+```
+
+```{r}
+# Pancreas - removed R389
+axys_pops_with_sums_panc_core_gsis_rm_389_list <- list(
+  axys_pops_panc_dioxin_rm_389_core = axys_pops_panc_dioxin_rm_389_core,
+  axys_pops_panc_pcb_rm_389_core = axys_pops_panc_pcb_rm_389_core,
+  axys_pops_panc_ocp_rm_389_core = axys_pops_panc_ocp_rm_389_core
+)
+
+axys_pops_with_sums_panc_jk_glu_gsis_rm_389_list <- list(
+  axys_pops_panc_dioxin_rm_389_jk_glu = axys_pops_panc_dioxin_rm_389_jk_glu,
+  axys_pops_panc_pcb_rm_389_jk_glu = axys_pops_panc_pcb_rm_389_jk_glu,
+  axys_pops_panc_ocp_rm_389_jk_glu = axys_pops_panc_ocp_rm_389_jk_glu
+)
+
+axys_pops_with_sums_panc_jk_leu_gsis_rm_389_list <- list(
+  axys_pops_panc_dioxin_rm_389_jk_leu = axys_pops_panc_dioxin_rm_389_jk_leu,
+  axys_pops_panc_pcb_rm_389_jk_leu = axys_pops_panc_pcb_rm_389_jk_leu,
+  axys_pops_panc_ocp_rm_389_jk_leu = axys_pops_panc_ocp_rm_389_jk_leu
+)
+
+axys_pops_with_sums_panc_jk_fa_gsis_rm_389_list <- list(
+  axys_pops_panc_dioxin_rm_389_jk_fa = axys_pops_panc_dioxin_rm_389_jk_fa,
+  axys_pops_panc_pcb_rm_389_jk_fa = axys_pops_panc_pcb_rm_389_jk_fa,
+  axys_pops_panc_ocp_rm_389_jk_fa = axys_pops_panc_ocp_rm_389_jk_fa
+)
+
+axys_pops_with_sums_panc_mh_glu_gsis_rm_389_list <- list(
+  axys_pops_panc_dioxin_rm_389_mh_glu = axys_pops_panc_dioxin_rm_389_mh_glu,
+  axys_pops_panc_pcb_rm_389_mh_glu = axys_pops_panc_pcb_rm_389_mh_glu,
+  axys_pops_panc_ocp_rm_389_mh_glu = axys_pops_panc_ocp_rm_389_mh_glu
+)
+```
+
+```{r}
+# Pancreas - removed R419
+axys_pops_with_sums_panc_core_gsis_rm_419_list <- list(
+  axys_pops_panc_dioxin_rm_419_core = axys_pops_panc_dioxin_rm_419_core,
+  axys_pops_panc_pcb_rm_419_core = axys_pops_panc_pcb_rm_419_core,
+  axys_pops_panc_ocp_rm_419_core = axys_pops_panc_ocp_rm_419_core
+)
+
+axys_pops_with_sums_panc_jk_glu_gsis_rm_419_list <- list(
+  axys_pops_panc_dioxin_rm_419_jk_glu = axys_pops_panc_dioxin_rm_419_jk_glu,
+  axys_pops_panc_pcb_rm_419_jk_glu = axys_pops_panc_pcb_rm_419_jk_glu,
+  axys_pops_panc_ocp_rm_419_jk_glu = axys_pops_panc_ocp_rm_419_jk_glu
+)
+
+axys_pops_with_sums_panc_jk_leu_gsis_rm_419_list <- list(
+  axys_pops_panc_dioxin_rm_419_jk_leu = axys_pops_panc_dioxin_rm_419_jk_leu,
+  axys_pops_panc_pcb_rm_419_jk_leu = axys_pops_panc_pcb_rm_419_jk_leu,
+  axys_pops_panc_ocp_rm_419_jk_leu = axys_pops_panc_ocp_rm_419_jk_leu
+)
+
+axys_pops_with_sums_panc_jk_fa_gsis_rm_419_list <- list(
+  axys_pops_panc_dioxin_rm_419_jk_fa = axys_pops_panc_dioxin_rm_419_jk_fa,
+  axys_pops_panc_pcb_rm_419_jk_fa = axys_pops_panc_pcb_rm_419_jk_fa,
+  axys_pops_panc_ocp_rm_419_jk_fa = axys_pops_panc_ocp_rm_419_jk_fa
+)
+
+axys_pops_with_sums_panc_mh_glu_gsis_rm_419_list <- list(
+  axys_pops_panc_dioxin_rm_419_mh_glu = axys_pops_panc_dioxin_rm_419_mh_glu,
+  axys_pops_panc_pcb_rm_419_mh_glu = axys_pops_panc_pcb_rm_419_mh_glu,
+  axys_pops_panc_ocp_rm_419_mh_glu = axys_pops_panc_ocp_rm_419_mh_glu
+)
+```
+
+```{r}
+# Pancreas - removed R448
+axys_pops_with_sums_panc_core_gsis_rm_448_list <- list(
+  axys_pops_panc_dioxin_rm_448_core = axys_pops_panc_dioxin_rm_448_core,
+  axys_pops_panc_pcb_rm_448_core = axys_pops_panc_pcb_rm_448_core,
+  axys_pops_panc_ocp_rm_448_core = axys_pops_panc_ocp_rm_448_core
+)
+
+axys_pops_with_sums_panc_jk_glu_gsis_rm_448_list <- list(
+  axys_pops_panc_dioxin_rm_448_jk_glu = axys_pops_panc_dioxin_rm_448_jk_glu,
+  axys_pops_panc_pcb_rm_448_jk_glu = axys_pops_panc_pcb_rm_448_jk_glu,
+  axys_pops_panc_ocp_rm_448_jk_glu = axys_pops_panc_ocp_rm_448_jk_glu
+)
+
+axys_pops_with_sums_panc_jk_leu_gsis_rm_448_list <- list(
+  axys_pops_panc_dioxin_rm_448_jk_leu = axys_pops_panc_dioxin_rm_448_jk_leu,
+  axys_pops_panc_pcb_rm_448_jk_leu = axys_pops_panc_pcb_rm_448_jk_leu,
+  axys_pops_panc_ocp_rm_448_jk_leu = axys_pops_panc_ocp_rm_448_jk_leu
+)
+
+axys_pops_with_sums_panc_jk_fa_gsis_rm_448_list <- list(
+  axys_pops_panc_dioxin_rm_448_jk_fa = axys_pops_panc_dioxin_rm_448_jk_fa,
+  axys_pops_panc_pcb_rm_448_jk_fa = axys_pops_panc_pcb_rm_448_jk_fa,
+  axys_pops_panc_ocp_rm_448_jk_fa = axys_pops_panc_ocp_rm_448_jk_fa
+)
+
+axys_pops_with_sums_panc_mh_glu_gsis_rm_448_list <- list(
+  axys_pops_panc_dioxin_rm_448_mh_glu = axys_pops_panc_dioxin_rm_448_mh_glu,
+  axys_pops_panc_pcb_rm_448_mh_glu = axys_pops_panc_pcb_rm_448_mh_glu,
+  axys_pops_panc_ocp_rm_448_mh_glu = axys_pops_panc_ocp_rm_448_mh_glu
+)
+```
+
+```{r}
+# Adipose - original data (no imputations or donors removed)
+axys_pops_with_sums_adip_core_gsis_orig_list <- list(
+  axys_pops_adip_dioxin_core = axys_pops_adip_dioxin_core,
+  axys_pops_adip_pcb_core = axys_pops_adip_pcb_core,
+  axys_pops_adip_ocp_core = axys_pops_adip_ocp_core
+)
+
+axys_pops_with_sums_adip_jk_glu_gsis_orig_list <- list(
+  axys_pops_adip_dioxin_jk_glu = axys_pops_adip_dioxin_jk_glu,
+  axys_pops_adip_pcb_jk_glu = axys_pops_adip_pcb_jk_glu,
+  axys_pops_adip_ocp_jk_glu = axys_pops_adip_ocp_jk_glu
+)
+
+axys_pops_with_sums_adip_jk_leu_gsis_orig_list <- list(
+  axys_pops_adip_dioxin_jk_leu = axys_pops_adip_dioxin_jk_leu,
+  axys_pops_adip_pcb_jk_leu = axys_pops_adip_pcb_jk_leu,
+  axys_pops_adip_ocp_jk_leu = axys_pops_adip_ocp_jk_leu
+)
+
+axys_pops_with_sums_adip_jk_fa_gsis_orig_list <- list(
+  axys_pops_adip_dioxin_jk_fa = axys_pops_adip_dioxin_jk_fa,
+  axys_pops_adip_pcb_jk_fa = axys_pops_adip_pcb_jk_fa,
+  axys_pops_adip_ocp_jk_fa = axys_pops_adip_ocp_jk_fa
+)
+
+axys_pops_with_sums_adip_mh_glu_gsis_orig_list <- list(
+  axys_pops_adip_dioxin_mh_glu = axys_pops_adip_dioxin_mh_glu,
+  axys_pops_adip_pcb_mh_glu = axys_pops_adip_pcb_mh_glu,
+  axys_pops_adip_ocp_mh_glu = axys_pops_adip_ocp_mh_glu
+)
+```
+
+```{r}
+# Adipose - with imputations
+axys_pops_with_sums_adip_core_gsis_imputed_list <- list(
+  axys_pops_adip_dioxin_imp_core = axys_pops_adip_dioxin_imp_core,
+  axys_pops_adip_pcb_imp_core = axys_pops_adip_pcb_imp_core,
+  axys_pops_adip_ocp_imp_core = axys_pops_adip_ocp_imp_core
+)
+
+axys_pops_with_sums_adip_jk_glu_gsis_imputed_list <- list(
+  axys_pops_adip_dioxin_imp_jk_glu = axys_pops_adip_dioxin_imp_jk_glu,
+  axys_pops_adip_pcb_imp_jk_glu = axys_pops_adip_pcb_imp_jk_glu,
+  axys_pops_adip_ocp_imp_jk_glu = axys_pops_adip_ocp_imp_jk_glu
+)
+
+axys_pops_with_sums_adip_jk_leu_gsis_imputed_list <- list(
+  axys_pops_adip_dioxin_imp_jk_leu = axys_pops_adip_dioxin_imp_jk_leu,
+  axys_pops_adip_pcb_imp_jk_leu = axys_pops_adip_pcb_imp_jk_leu,
+  axys_pops_adip_ocp_imp_jk_leu = axys_pops_adip_ocp_imp_jk_leu
+)
+
+axys_pops_with_sums_adip_jk_fa_gsis_imputed_list <- list(
+  axys_pops_adip_dioxin_imp_jk_fa = axys_pops_adip_dioxin_imp_jk_fa,
+  axys_pops_adip_pcb_imp_jk_fa = axys_pops_adip_pcb_imp_jk_fa,
+  axys_pops_adip_ocp_imp_jk_fa = axys_pops_adip_ocp_imp_jk_fa
+)
+
+axys_pops_with_sums_adip_mh_glu_gsis_imputed_list <- list(
+  axys_pops_adip_dioxin_imp_mh_glu = axys_pops_adip_dioxin_imp_mh_glu,
+  axys_pops_adip_pcb_imp_mh_glu = axys_pops_adip_pcb_imp_mh_glu,
+  axys_pops_adip_ocp_imp_mh_glu = axys_pops_adip_ocp_imp_mh_glu
+)
+```
+
+```{r}
+# Adipose - removed ALL outlier donors
+axys_pops_with_sums_adip_core_gsis_rm_outliers_list <- list(
+  axys_pops_adip_dioxin_rm_ind_core = axys_pops_adip_dioxin_rm_ind_core,
+  axys_pops_adip_pcb_rm_ind_core = axys_pops_adip_pcb_rm_ind_core,
+  axys_pops_adip_ocp_rm_ind_core = axys_pops_adip_ocp_rm_ind_core
+)
+
+axys_pops_with_sums_adip_jk_glu_gsis_rm_outliers_list <- list(
+  axys_pops_adip_dioxin_rm_ind_jk_glu = axys_pops_adip_dioxin_rm_ind_jk_glu,
+  axys_pops_adip_pcb_rm_ind_jk_glu = axys_pops_adip_pcb_rm_ind_jk_glu,
+  axys_pops_adip_ocp_rm_ind_jk_glu = axys_pops_adip_ocp_rm_ind_jk_glu
+)
+
+axys_pops_with_sums_adip_jk_leu_gsis_rm_outliers_list <- list(
+  axys_pops_adip_dioxin_rm_ind_jk_leu = axys_pops_adip_dioxin_rm_ind_jk_leu,
+  axys_pops_adip_pcb_rm_ind_jk_leu = axys_pops_adip_pcb_rm_ind_jk_leu,
+  axys_pops_adip_ocp_rm_ind_jk_leu = axys_pops_adip_ocp_rm_ind_jk_leu
+)
+
+axys_pops_with_sums_adip_jk_fa_gsis_rm_outliers_list <- list(
+  axys_pops_adip_dioxin_rm_ind_jk_fa = axys_pops_adip_dioxin_rm_ind_jk_fa,
+  axys_pops_adip_pcb_rm_ind_jk_fa = axys_pops_adip_pcb_rm_ind_jk_fa,
+  axys_pops_adip_ocp_rm_ind_jk_fa = axys_pops_adip_ocp_rm_ind_jk_fa
+)
+
+axys_pops_with_sums_adip_mh_glu_gsis_rm_outliers_list <- list(
+  axys_pops_adip_dioxin_rm_ind_mh_glu = axys_pops_adip_dioxin_rm_ind_mh_glu,
+  axys_pops_adip_pcb_rm_ind_mh_glu = axys_pops_adip_pcb_rm_ind_mh_glu,
+  axys_pops_adip_ocp_rm_ind_mh_glu = axys_pops_adip_ocp_rm_ind_mh_glu
+)
+```
+
+```{r}
+# Adipose - removed R419
+axys_pops_with_sums_adip_core_gsis_rm_419_list <- list(
+  axys_pops_adip_dioxin_rm_419_core = axys_pops_adip_dioxin_rm_419_core,
+  axys_pops_adip_pcb_rm_419_core = axys_pops_adip_pcb_rm_419_core,
+  axys_pops_adip_ocp_rm_419_core = axys_pops_adip_ocp_rm_419_core
+)
+
+axys_pops_with_sums_adip_jk_glu_gsis_rm_419_list <- list(
+  axys_pops_adip_dioxin_rm_419_jk_glu = axys_pops_adip_dioxin_rm_419_jk_glu,
+  axys_pops_adip_pcb_rm_419_jk_glu = axys_pops_adip_pcb_rm_419_jk_glu,
+  axys_pops_adip_ocp_rm_419_jk_glu = axys_pops_adip_ocp_rm_419_jk_glu
+)
+
+axys_pops_with_sums_adip_jk_leu_gsis_rm_419_list <- list(
+  axys_pops_adip_dioxin_rm_419_jk_leu = axys_pops_adip_dioxin_rm_419_jk_leu,
+  axys_pops_adip_pcb_rm_419_jk_leu = axys_pops_adip_pcb_rm_419_jk_leu,
+  axys_pops_adip_ocp_rm_419_jk_leu = axys_pops_adip_ocp_rm_419_jk_leu
+)
+
+axys_pops_with_sums_adip_jk_fa_gsis_rm_419_list <- list(
+  axys_pops_adip_dioxin_rm_419_jk_fa = axys_pops_adip_dioxin_rm_419_jk_fa,
+  axys_pops_adip_pcb_rm_419_jk_fa = axys_pops_adip_pcb_rm_419_jk_fa,
+  axys_pops_adip_ocp_rm_419_jk_fa = axys_pops_adip_ocp_rm_419_jk_fa
+)
+
+axys_pops_with_sums_adip_mh_glu_gsis_rm_419_list <- list(
+  axys_pops_adip_dioxin_rm_419_mh_glu = axys_pops_adip_dioxin_rm_419_mh_glu,
+  axys_pops_adip_pcb_rm_419_mh_glu = axys_pops_adip_pcb_rm_419_mh_glu,
+  axys_pops_adip_ocp_rm_419_mh_glu = axys_pops_adip_ocp_rm_419_mh_glu
+)
+```
+
+```{r}
+# Adipose - removed R421
+axys_pops_with_sums_adip_core_gsis_rm_421_list <- list(
+  axys_pops_adip_dioxin_rm_421_core = axys_pops_adip_dioxin_rm_421_core,
+  axys_pops_adip_pcb_rm_421_core = axys_pops_adip_pcb_rm_421_core,
+  axys_pops_adip_ocp_rm_421_core = axys_pops_adip_ocp_rm_421_core
+)
+
+axys_pops_with_sums_adip_jk_glu_gsis_rm_421_list <- list(
+  axys_pops_adip_dioxin_rm_421_jk_glu = axys_pops_adip_dioxin_rm_421_jk_glu,
+  axys_pops_adip_pcb_rm_421_jk_glu = axys_pops_adip_pcb_rm_421_jk_glu,
+  axys_pops_adip_ocp_rm_421_jk_glu = axys_pops_adip_ocp_rm_421_jk_glu
+)
+
+axys_pops_with_sums_adip_jk_leu_gsis_rm_421_list <- list(
+  axys_pops_adip_dioxin_rm_421_jk_leu = axys_pops_adip_dioxin_rm_421_jk_leu,
+  axys_pops_adip_pcb_rm_421_jk_leu = axys_pops_adip_pcb_rm_421_jk_leu,
+  axys_pops_adip_ocp_rm_421_jk_leu = axys_pops_adip_ocp_rm_421_jk_leu
+)
+
+axys_pops_with_sums_adip_jk_fa_gsis_rm_421_list <- list(
+  axys_pops_adip_dioxin_rm_421_jk_fa = axys_pops_adip_dioxin_rm_421_jk_fa,
+  axys_pops_adip_pcb_rm_421_jk_fa = axys_pops_adip_pcb_rm_421_jk_fa,
+  axys_pops_adip_ocp_rm_421_jk_fa = axys_pops_adip_ocp_rm_421_jk_fa
+)
+
+axys_pops_with_sums_adip_mh_glu_gsis_rm_421_list <- list(
+  axys_pops_adip_dioxin_rm_421_mh_glu = axys_pops_adip_dioxin_rm_421_mh_glu,
+  axys_pops_adip_pcb_rm_421_mh_glu = axys_pops_adip_pcb_rm_421_mh_glu,
+  axys_pops_adip_ocp_rm_421_mh_glu = axys_pops_adip_ocp_rm_421_mh_glu
+)
+```
+
+## Perform Kendall correlations
+
+```{r}
+# Perform Kendall correlations - Pancreas
+corr_axys_panc_core_gsis_orig <- map(axys_pops_with_sums_panc_core_gsis_orig_list, cor.mtest)
+corr_axys_panc_jk_glu_gsis_orig <- map(axys_pops_with_sums_panc_jk_glu_gsis_orig_list, cor.mtest)
+corr_axys_panc_jk_leu_gsis_orig <- map(axys_pops_with_sums_panc_jk_leu_gsis_orig_list, cor.mtest)
+corr_axys_panc_jk_fa_gsis_orig <- map(axys_pops_with_sums_panc_jk_fa_gsis_orig_list, cor.mtest)
+corr_axys_panc_mh_glu_gsis_orig <- map(axys_pops_with_sums_panc_mh_glu_gsis_orig_list, cor.mtest)
+
+corr_axys_panc_core_gsis_imputed <- map(axys_pops_with_sums_panc_core_gsis_imputed_list, cor.mtest)
+corr_axys_panc_jk_glu_gsis_imputed <- map(axys_pops_with_sums_panc_jk_glu_gsis_imputed_list, cor.mtest)
+corr_axys_panc_jk_leu_gsis_imputed <- map(axys_pops_with_sums_panc_jk_leu_gsis_imputed_list, cor.mtest)
+corr_axys_panc_jk_fa_gsis_imputed <- map(axys_pops_with_sums_panc_jk_fa_gsis_imputed_list, cor.mtest)
+corr_axys_panc_mh_glu_gsis_imputed <- map(axys_pops_with_sums_panc_mh_glu_gsis_imputed_list, cor.mtest)
+
+corr_axys_panc_core_gsis_rm_outliers <- map(axys_pops_with_sums_panc_core_gsis_rm_outliers_list, cor.mtest)
+corr_axys_panc_jk_glu_gsis_rm_outliers <- map(axys_pops_with_sums_panc_jk_glu_gsis_rm_outliers_list, cor.mtest)
+corr_axys_panc_jk_leu_gsis_rm_outliers <- map(axys_pops_with_sums_panc_jk_leu_gsis_rm_outliers_list, cor.mtest)
+corr_axys_panc_jk_fa_gsis_rm_outliers <- map(axys_pops_with_sums_panc_jk_fa_gsis_rm_outliers_list, cor.mtest)
+corr_axys_panc_mh_glu_gsis_rm_outliers <- map(axys_pops_with_sums_panc_mh_glu_gsis_rm_outliers_list, cor.mtest)
+
+corr_axys_panc_core_gsis_rm_389 <- map(axys_pops_with_sums_panc_core_gsis_rm_389_list, cor.mtest)
+corr_axys_panc_jk_glu_gsis_rm_389 <- map(axys_pops_with_sums_panc_jk_glu_gsis_rm_389_list, cor.mtest)
+corr_axys_panc_jk_leu_gsis_rm_389 <- map(axys_pops_with_sums_panc_jk_leu_gsis_rm_389_list, cor.mtest)
+corr_axys_panc_jk_fa_gsis_rm_389 <- map(axys_pops_with_sums_panc_jk_fa_gsis_rm_389_list, cor.mtest)
+corr_axys_panc_mh_glu_gsis_rm_389 <- map(axys_pops_with_sums_panc_mh_glu_gsis_rm_389_list, cor.mtest)
+
+corr_axys_panc_core_gsis_rm_419 <- map(axys_pops_with_sums_panc_core_gsis_rm_419_list, cor.mtest)
+corr_axys_panc_jk_glu_gsis_rm_419 <- map(axys_pops_with_sums_panc_jk_glu_gsis_rm_419_list, cor.mtest)
+corr_axys_panc_jk_leu_gsis_rm_419 <- map(axys_pops_with_sums_panc_jk_leu_gsis_rm_419_list, cor.mtest)
+corr_axys_panc_jk_fa_gsis_rm_419 <- map(axys_pops_with_sums_panc_jk_fa_gsis_rm_419_list, cor.mtest)
+corr_axys_panc_mh_glu_gsis_rm_419 <- map(axys_pops_with_sums_panc_mh_glu_gsis_rm_419_list, cor.mtest)
+
+corr_axys_panc_core_gsis_rm_448 <- map(axys_pops_with_sums_panc_core_gsis_rm_448_list, cor.mtest)
+corr_axys_panc_jk_glu_gsis_rm_448 <- map(axys_pops_with_sums_panc_jk_glu_gsis_rm_448_list, cor.mtest)
+corr_axys_panc_jk_leu_gsis_rm_448 <- map(axys_pops_with_sums_panc_jk_leu_gsis_rm_448_list, cor.mtest)
+corr_axys_panc_jk_fa_gsis_rm_448 <- map(axys_pops_with_sums_panc_jk_fa_gsis_rm_448_list, cor.mtest)
+corr_axys_panc_mh_glu_gsis_rm_448 <- map(axys_pops_with_sums_panc_mh_glu_gsis_rm_448_list, cor.mtest)
+```
+
+```{r}
+# Perform Kendall correlations - Adipose
+corr_axys_adip_core_gsis_orig <- map(axys_pops_with_sums_adip_core_gsis_orig_list, cor.mtest)
+corr_axys_adip_jk_glu_gsis_orig <- map(axys_pops_with_sums_adip_jk_glu_gsis_orig_list, cor.mtest)
+corr_axys_adip_jk_leu_gsis_orig <- map(axys_pops_with_sums_adip_jk_leu_gsis_orig_list, cor.mtest)
+corr_axys_adip_jk_fa_gsis_orig <- map(axys_pops_with_sums_adip_jk_fa_gsis_orig_list, cor.mtest)
+corr_axys_adip_mh_glu_gsis_orig <- map(axys_pops_with_sums_adip_mh_glu_gsis_orig_list, cor.mtest)
+
+corr_axys_adip_core_gsis_imputed <- map(axys_pops_with_sums_adip_core_gsis_imputed_list, cor.mtest)
+corr_axys_adip_jk_glu_gsis_imputed <- map(axys_pops_with_sums_adip_jk_glu_gsis_imputed_list, cor.mtest)
+corr_axys_adip_jk_leu_gsis_imputed <- map(axys_pops_with_sums_adip_jk_leu_gsis_imputed_list, cor.mtest)
+corr_axys_adip_jk_fa_gsis_imputed <- map(axys_pops_with_sums_adip_jk_fa_gsis_imputed_list, cor.mtest)
+corr_axys_adip_mh_glu_gsis_imputed <- map(axys_pops_with_sums_adip_mh_glu_gsis_imputed_list, cor.mtest)
+
+corr_axys_adip_core_gsis_rm_outliers <- map(axys_pops_with_sums_adip_core_gsis_rm_outliers_list, cor.mtest)
+corr_axys_adip_jk_glu_gsis_rm_outliers <- map(axys_pops_with_sums_adip_jk_glu_gsis_rm_outliers_list, cor.mtest)
+corr_axys_adip_jk_leu_gsis_rm_outliers <- map(axys_pops_with_sums_adip_jk_leu_gsis_rm_outliers_list, cor.mtest)
+corr_axys_adip_jk_fa_gsis_rm_outliers <- map(axys_pops_with_sums_adip_jk_fa_gsis_rm_outliers_list, cor.mtest)
+corr_axys_adip_mh_glu_gsis_rm_outliers <- map(axys_pops_with_sums_adip_mh_glu_gsis_rm_outliers_list, cor.mtest)
+
+corr_axys_adip_core_gsis_rm_419 <- map(axys_pops_with_sums_adip_core_gsis_rm_419_list, cor.mtest)
+corr_axys_adip_jk_glu_gsis_rm_419 <- map(axys_pops_with_sums_adip_jk_glu_gsis_rm_419_list, cor.mtest)
+corr_axys_adip_jk_leu_gsis_rm_419 <- map(axys_pops_with_sums_adip_jk_leu_gsis_rm_419_list, cor.mtest)
+corr_axys_adip_jk_fa_gsis_rm_419 <- map(axys_pops_with_sums_adip_jk_fa_gsis_rm_419_list, cor.mtest)
+corr_axys_adip_mh_glu_gsis_rm_419 <- map(axys_pops_with_sums_adip_mh_glu_gsis_rm_419_list, cor.mtest)
+
+corr_axys_adip_core_gsis_rm_421 <- map(axys_pops_with_sums_adip_core_gsis_rm_421_list, cor.mtest)
+corr_axys_adip_jk_glu_gsis_rm_421 <- map(axys_pops_with_sums_adip_jk_glu_gsis_rm_421_list, cor.mtest)
+corr_axys_adip_jk_leu_gsis_rm_421 <- map(axys_pops_with_sums_adip_jk_leu_gsis_rm_421_list, cor.mtest)
+corr_axys_adip_jk_fa_gsis_rm_421 <- map(axys_pops_with_sums_adip_jk_fa_gsis_rm_421_list, cor.mtest)
+corr_axys_adip_mh_glu_gsis_rm_421 <- map(axys_pops_with_sums_adip_mh_glu_gsis_rm_421_list, cor.mtest)
+```
+
+
+```{r, fig.width = 8}
+# Map the plotting function over the list of correlation matrices
+# imap(corr_axys_panc_gsis_orig, plot_correlation)
+# imap(corr_axys_panc_gsis_imputed, plot_correlation)
+# imap(corr_axys_panc_gsis_rm_outliers, plot_correlation)
+# imap(corr_axys_panc_gsis_rm_389, plot_correlation)
+# imap(corr_axys_panc_gsis_rm_419, plot_correlation)
+# imap(corr_axys_panc_gsis_rm_448, plot_correlation)
+# 
+# imap(corr_axys_adip_gsis_orig, plot_correlation)
+# imap(corr_axys_adip_gsis_imputed, plot_correlation)
+# imap(corr_axys_adip_gsis_rm_outliers, plot_correlation)
+# imap(corr_axys_adip_gsis_rm_419, plot_correlation)
+# imap(corr_axys_adip_gsis_rm_421, plot_correlation)
+```
+
+```{r}
+# Perform kendall correlations and export to csv for MH - Pancreas
+corr_axys_panc_core_gsis_orig_csv <- map(axys_pops_with_sums_panc_core_gsis_orig_list, cor.flat.for.prism)
+corr_axys_panc_jk_glu_gsis_orig_csv <- map(axys_pops_with_sums_panc_jk_glu_gsis_orig_list, cor.flat.for.prism)
+corr_axys_panc_jk_leu_gsis_orig_csv <- map(axys_pops_with_sums_panc_jk_leu_gsis_orig_list, cor.flat.for.prism)
+corr_axys_panc_jk_fa_gsis_orig_csv <- map(axys_pops_with_sums_panc_jk_fa_gsis_orig_list, cor.flat.for.prism)
+corr_axys_panc_mh_glu_gsis_orig_csv <- map(axys_pops_with_sums_panc_mh_glu_gsis_orig_list, cor.flat.for.prism)
+
+corr_axys_panc_core_gsis_imputed_csv <- map(axys_pops_with_sums_panc_core_gsis_imputed_list, cor.flat.for.prism)
+corr_axys_panc_jk_glu_gsis_imputed_csv <- map(axys_pops_with_sums_panc_jk_glu_gsis_imputed_list, cor.flat.for.prism)
+corr_axys_panc_jk_leu_gsis_imputed_csv <- map(axys_pops_with_sums_panc_jk_leu_gsis_imputed_list, cor.flat.for.prism)
+corr_axys_panc_jk_fa_gsis_imputed_csv <- map(axys_pops_with_sums_panc_jk_fa_gsis_imputed_list, cor.flat.for.prism)
+corr_axys_panc_mh_glu_gsis_imputed_csv <- map(axys_pops_with_sums_panc_mh_glu_gsis_imputed_list, cor.flat.for.prism)
+
+corr_axys_panc_core_gsis_rm_outliers_csv <- map(axys_pops_with_sums_panc_core_gsis_rm_outliers_list, cor.flat.for.prism)
+corr_axys_panc_jk_glu_gsis_rm_outliers_csv <- map(axys_pops_with_sums_panc_jk_glu_gsis_rm_outliers_list, cor.flat.for.prism)
+corr_axys_panc_jk_leu_gsis_rm_outliers_csv <- map(axys_pops_with_sums_panc_jk_leu_gsis_rm_outliers_list, cor.flat.for.prism)
+corr_axys_panc_jk_fa_gsis_rm_outliers_csv <- map(axys_pops_with_sums_panc_jk_fa_gsis_rm_outliers_list, cor.flat.for.prism)
+corr_axys_panc_mh_glu_gsis_rm_outliers_csv <- map(axys_pops_with_sums_panc_mh_glu_gsis_rm_outliers_list, cor.flat.for.prism)
+
+corr_axys_panc_core_gsis_rm_389_csv <- map(axys_pops_with_sums_panc_core_gsis_rm_389_list, cor.flat.for.prism)
+corr_axys_panc_jk_glu_gsis_rm_389_csv <- map(axys_pops_with_sums_panc_jk_glu_gsis_rm_389_list, cor.flat.for.prism)
+corr_axys_panc_jk_leu_gsis_rm_389_csv <- map(axys_pops_with_sums_panc_jk_leu_gsis_rm_389_list, cor.flat.for.prism)
+corr_axys_panc_jk_fa_gsis_rm_389_csv <- map(axys_pops_with_sums_panc_jk_fa_gsis_rm_389_list, cor.flat.for.prism)
+corr_axys_panc_mh_glu_gsis_rm_389_csv <- map(axys_pops_with_sums_panc_mh_glu_gsis_rm_389_list, cor.flat.for.prism)
+
+corr_axys_panc_core_gsis_rm_419_csv <- map(axys_pops_with_sums_panc_core_gsis_rm_419_list, cor.flat.for.prism)
+corr_axys_panc_jk_glu_gsis_rm_419_csv <- map(axys_pops_with_sums_panc_jk_glu_gsis_rm_419_list, cor.flat.for.prism)
+corr_axys_panc_jk_leu_gsis_rm_419_csv <- map(axys_pops_with_sums_panc_jk_leu_gsis_rm_419_list, cor.flat.for.prism)
+corr_axys_panc_jk_fa_gsis_rm_419_csv <- map(axys_pops_with_sums_panc_jk_fa_gsis_rm_419_list, cor.flat.for.prism)
+corr_axys_panc_mh_glu_gsis_rm_419_csv <- map(axys_pops_with_sums_panc_mh_glu_gsis_rm_419_list, cor.flat.for.prism)
+
+corr_axys_panc_core_gsis_rm_448_csv <- map(axys_pops_with_sums_panc_core_gsis_rm_448_list, cor.flat.for.prism)
+corr_axys_panc_jk_glu_gsis_rm_448_csv <- map(axys_pops_with_sums_panc_jk_glu_gsis_rm_448_list, cor.flat.for.prism)
+corr_axys_panc_jk_leu_gsis_rm_448_csv <- map(axys_pops_with_sums_panc_jk_leu_gsis_rm_448_list, cor.flat.for.prism)
+corr_axys_panc_jk_fa_gsis_rm_448_csv <- map(axys_pops_with_sums_panc_jk_fa_gsis_rm_448_list, cor.flat.for.prism)
+corr_axys_panc_mh_glu_gsis_rm_448_csv <- map(axys_pops_with_sums_panc_mh_glu_gsis_rm_448_list, cor.flat.for.prism)
+```
+
+```{r}
+# Perform kendall correlations and export to csv for MH - Adipose
+corr_axys_adip_core_gsis_orig_csv <- map(axys_pops_with_sums_adip_core_gsis_orig_list, cor.flat.for.prism)
+corr_axys_adip_jk_glu_gsis_orig_csv <- map(axys_pops_with_sums_adip_jk_glu_gsis_orig_list, cor.flat.for.prism)
+corr_axys_adip_jk_leu_gsis_orig_csv <- map(axys_pops_with_sums_adip_jk_leu_gsis_orig_list, cor.flat.for.prism)
+corr_axys_adip_jk_fa_gsis_orig_csv <- map(axys_pops_with_sums_adip_jk_fa_gsis_orig_list, cor.flat.for.prism)
+corr_axys_adip_mh_glu_gsis_orig_csv <- map(axys_pops_with_sums_adip_mh_glu_gsis_orig_list, cor.flat.for.prism)
+
+corr_axys_adip_core_gsis_imputed_csv <- map(axys_pops_with_sums_adip_core_gsis_imputed_list, cor.flat.for.prism)
+corr_axys_adip_jk_glu_gsis_imputed_csv <- map(axys_pops_with_sums_adip_jk_glu_gsis_imputed_list, cor.flat.for.prism)
+corr_axys_adip_jk_leu_gsis_imputed_csv <- map(axys_pops_with_sums_adip_jk_leu_gsis_imputed_list, cor.flat.for.prism)
+corr_axys_adip_jk_fa_gsis_imputed_csv <- map(axys_pops_with_sums_adip_jk_fa_gsis_imputed_list, cor.flat.for.prism)
+corr_axys_adip_mh_glu_gsis_imputed_csv <- map(axys_pops_with_sums_adip_mh_glu_gsis_imputed_list, cor.flat.for.prism)
+
+corr_axys_adip_core_gsis_rm_outliers_csv <- map(axys_pops_with_sums_adip_core_gsis_rm_outliers_list, cor.flat.for.prism)
+corr_axys_adip_jk_glu_gsis_rm_outliers_csv <- map(axys_pops_with_sums_adip_jk_glu_gsis_rm_outliers_list, cor.flat.for.prism)
+corr_axys_adip_jk_leu_gsis_rm_outliers_csv <- map(axys_pops_with_sums_adip_jk_leu_gsis_rm_outliers_list, cor.flat.for.prism)
+corr_axys_adip_jk_fa_gsis_rm_outliers_csv <- map(axys_pops_with_sums_adip_jk_fa_gsis_rm_outliers_list, cor.flat.for.prism)
+corr_axys_adip_mh_glu_gsis_rm_outliers_csv <- map(axys_pops_with_sums_adip_mh_glu_gsis_rm_outliers_list, cor.flat.for.prism)
+
+corr_axys_adip_core_gsis_rm_419_csv <- map(axys_pops_with_sums_adip_core_gsis_rm_419_list, cor.flat.for.prism)
+corr_axys_adip_jk_glu_gsis_rm_419_csv <- map(axys_pops_with_sums_adip_jk_glu_gsis_rm_419_list, cor.flat.for.prism)
+corr_axys_adip_jk_leu_gsis_rm_419_csv <- map(axys_pops_with_sums_adip_jk_leu_gsis_rm_419_list, cor.flat.for.prism)
+corr_axys_adip_jk_fa_gsis_rm_419_csv <- map(axys_pops_with_sums_adip_jk_fa_gsis_rm_419_list, cor.flat.for.prism)
+corr_axys_adip_mh_glu_gsis_rm_419_csv <- map(axys_pops_with_sums_adip_mh_glu_gsis_rm_419_list, cor.flat.for.prism)
+
+corr_axys_adip_core_gsis_rm_421_csv <- map(axys_pops_with_sums_adip_core_gsis_rm_421_list, cor.flat.for.prism)
+corr_axys_adip_jk_glu_gsis_rm_421_csv <- map(axys_pops_with_sums_adip_jk_glu_gsis_rm_421_list, cor.flat.for.prism)
+corr_axys_adip_jk_leu_gsis_rm_421_csv <- map(axys_pops_with_sums_adip_jk_leu_gsis_rm_421_list, cor.flat.for.prism)
+corr_axys_adip_jk_fa_gsis_rm_421_csv <- map(axys_pops_with_sums_adip_jk_fa_gsis_rm_421_list, cor.flat.for.prism)
+corr_axys_adip_mh_glu_gsis_rm_421_csv <- map(axys_pops_with_sums_adip_mh_glu_gsis_rm_421_list, cor.flat.for.prism)
+```
+
+
+```{r}
+# Export results to CSV
+corr_axys_analytes_gsis_orig_csv <- list(
+  corr_axys_panc_core_gsis_orig_csv = corr_axys_panc_core_gsis_orig_csv,
+  corr_axys_panc_jk_glu_gsis_orig_csv = corr_axys_panc_jk_glu_gsis_orig_csv,
+  corr_axys_panc_jk_leu_gsis_orig_csv = corr_axys_panc_jk_leu_gsis_orig_csv,
+  corr_axys_panc_jk_fa_gsis_orig_csv = corr_axys_panc_jk_fa_gsis_orig_csv,
+  corr_axys_panc_mh_glu_gsis_orig_csv = corr_axys_panc_mh_glu_gsis_orig_csv,
+  
+  corr_axys_adip_core_gsis_orig_csv = corr_axys_adip_core_gsis_orig_csv,
+  corr_axys_adip_jk_glu_gsis_orig_csv = corr_axys_adip_jk_glu_gsis_orig_csv,
+  corr_axys_adip_jk_leu_gsis_orig_csv = corr_axys_adip_jk_leu_gsis_orig_csv,
+  corr_axys_adip_jk_fa_gsis_orig_csv = corr_axys_adip_jk_fa_gsis_orig_csv,
+  corr_axys_adip_mh_glu_gsis_orig_csv = corr_axys_adip_mh_glu_gsis_orig_csv
+)
+
+corr_axys_analytes_gsis_imputed_csv <- list(
+  corr_axys_panc_core_gsis_imputed_csv = corr_axys_panc_core_gsis_imputed_csv,
+  corr_axys_panc_jk_glu_gsis_imputed_csv = corr_axys_panc_jk_glu_gsis_imputed_csv,
+  corr_axys_panc_jk_leu_gsis_imputed_csv = corr_axys_panc_jk_leu_gsis_imputed_csv,
+  corr_axys_panc_jk_fa_gsis_imputed_csv = corr_axys_panc_jk_fa_gsis_imputed_csv,
+  corr_axys_panc_mh_glu_gsis_imputed_csv = corr_axys_panc_mh_glu_gsis_imputed_csv,
+  
+  corr_axys_adip_core_gsis_imputed_csv = corr_axys_adip_core_gsis_imputed_csv,
+  corr_axys_adip_jk_glu_gsis_imputed_csv = corr_axys_adip_jk_glu_gsis_imputed_csv,
+  corr_axys_adip_jk_leu_gsis_imputed_csv = corr_axys_adip_jk_leu_gsis_imputed_csv,
+  corr_axys_adip_jk_fa_gsis_imputed_csv = corr_axys_adip_jk_fa_gsis_imputed_csv,
+  corr_axys_adip_mh_glu_gsis_imputed_csv = corr_axys_adip_mh_glu_gsis_imputed_csv
+)
+
+corr_axys_analytes_gsis_rm_outliers_csv <- list(
+  corr_axys_panc_core_gsis_rm_outliers_csv = corr_axys_panc_core_gsis_rm_outliers_csv,
+  corr_axys_panc_jk_glu_gsis_rm_outliers_csv = corr_axys_panc_jk_glu_gsis_rm_outliers_csv,
+  corr_axys_panc_jk_leu_gsis_rm_outliers_csv = corr_axys_panc_jk_leu_gsis_rm_outliers_csv,
+  corr_axys_panc_jk_fa_gsis_rm_outliers_csv = corr_axys_panc_jk_fa_gsis_rm_outliers_csv,
+  corr_axys_panc_mh_glu_gsis_rm_outliers_csv = corr_axys_panc_mh_glu_gsis_rm_outliers_csv,
+  
+  corr_axys_adip_core_gsis_rm_outliers_csv = corr_axys_adip_core_gsis_rm_outliers_csv,
+  corr_axys_adip_jk_glu_gsis_rm_outliers_csv = corr_axys_adip_jk_glu_gsis_rm_outliers_csv,
+  corr_axys_adip_jk_leu_gsis_rm_outliers_csv = corr_axys_adip_jk_leu_gsis_rm_outliers_csv,
+  corr_axys_adip_jk_fa_gsis_rm_outliers_csv = corr_axys_adip_jk_fa_gsis_rm_outliers_csv,
+  corr_axys_adip_mh_glu_gsis_rm_outliers_csv = corr_axys_adip_mh_glu_gsis_rm_outliers_csv
+)
+  
+corr_axys_analytes_panc_gsis_rm_389_csv <- list(
+  corr_axys_panc_core_gsis_rm_389_csv = corr_axys_panc_core_gsis_rm_389_csv,
+  corr_axys_panc_jk_glu_gsis_rm_389_csv = corr_axys_panc_jk_glu_gsis_rm_389_csv,
+  corr_axys_panc_jk_leu_gsis_rm_389_csv = corr_axys_panc_jk_leu_gsis_rm_389_csv,
+  corr_axys_panc_jk_fa_gsis_rm_389_csv = corr_axys_panc_jk_fa_gsis_rm_389_csv,
+  corr_axys_panc_mh_glu_gsis_rm_389_csv = corr_axys_panc_mh_glu_gsis_rm_389_csv
+)
+
+corr_axys_analytes_panc_gsis_rm_419_csv <- list(
+  corr_axys_panc_core_gsis_rm_419_csv = corr_axys_panc_core_gsis_rm_419_csv,
+  corr_axys_panc_jk_glu_gsis_rm_419_csv = corr_axys_panc_jk_glu_gsis_rm_419_csv,
+  corr_axys_panc_jk_leu_gsis_rm_419_csv = corr_axys_panc_jk_leu_gsis_rm_419_csv,
+  corr_axys_panc_jk_fa_gsis_rm_419_csv = corr_axys_panc_jk_fa_gsis_rm_419_csv,
+  corr_axys_panc_mh_glu_gsis_rm_419_csv = corr_axys_panc_mh_glu_gsis_rm_419_csv
+)
+
+corr_axys_analytes_panc_gsis_rm_448_csv <- list(
+  corr_axys_panc_core_gsis_rm_448_csv = corr_axys_panc_core_gsis_rm_448_csv,
+  corr_axys_panc_jk_glu_gsis_rm_448_csv = corr_axys_panc_jk_glu_gsis_rm_448_csv,
+  corr_axys_panc_jk_leu_gsis_rm_448_csv = corr_axys_panc_jk_leu_gsis_rm_448_csv,
+  corr_axys_panc_jk_fa_gsis_rm_448_csv = corr_axys_panc_jk_fa_gsis_rm_448_csv,
+  corr_axys_panc_mh_glu_gsis_rm_448_csv = corr_axys_panc_mh_glu_gsis_rm_448_csv
+)
+
+corr_axys_analytes_adip_gsis_rm_419_csv <- list(
+  corr_axys_adip_core_gsis_rm_419_csv = corr_axys_adip_core_gsis_rm_419_csv,
+  corr_axys_adip_jk_glu_gsis_rm_419_csv = corr_axys_adip_jk_glu_gsis_rm_419_csv,
+  corr_axys_adip_jk_leu_gsis_rm_419_csv = corr_axys_adip_jk_leu_gsis_rm_419_csv,
+  corr_axys_adip_jk_fa_gsis_rm_419_csv = corr_axys_adip_jk_fa_gsis_rm_419_csv,
+  corr_axys_adip_mh_glu_gsis_rm_419_csv = corr_axys_adip_mh_glu_gsis_rm_419_csv
+)
+
+corr_axys_analytes_adip_gsis_rm_421_csv <- list(
+  corr_axys_adip_core_gsis_rm_421_csv = corr_axys_adip_core_gsis_rm_421_csv,
+  corr_axys_adip_jk_glu_gsis_rm_421_csv = corr_axys_adip_jk_glu_gsis_rm_421_csv,
+  corr_axys_adip_jk_leu_gsis_rm_421_csv = corr_axys_adip_jk_leu_gsis_rm_421_csv,
+  corr_axys_adip_jk_fa_gsis_rm_421_csv = corr_axys_adip_jk_fa_gsis_rm_421_csv,
+  corr_axys_adip_mh_glu_gsis_rm_421_csv = corr_axys_adip_mh_glu_gsis_rm_421_csv
+)
+
+# map2(corr_axys_adip_mh_glu_gsis_orig_csv, names(corr_axys_adip_mh_glu_gsis_orig_csv), ~ {
+#   write.csv(x = .x, file = paste0(date_today, "_", .y, "-adip_analyte_conc_vs_MH_glucose_perifusion", ".csv"), row.names = TRUE)
+# })
+```
+
+## Calculate percent change in correlation coefficient
+
+```{r}
+# Extract table for percent change in correlation coefficient
+corr_axys_panc_core_gsis_orig_tbl <- map(axys_pops_with_sums_panc_core_gsis_orig_list, cor.adi)
+corr_axys_panc_jk_glu_gsis_orig_tbl <- map(axys_pops_with_sums_panc_jk_glu_gsis_orig_list, cor.jk)
+corr_axys_panc_jk_leu_gsis_orig_tbl <- map(axys_pops_with_sums_panc_jk_leu_gsis_orig_list, cor.jk)
+corr_axys_panc_jk_fa_gsis_orig_tbl <- map(axys_pops_with_sums_panc_jk_fa_gsis_orig_list, cor.jk)
+corr_axys_panc_mh_glu_gsis_orig_tbl <- map(axys_pops_with_sums_panc_mh_glu_gsis_orig_list, cor.mh)
+
+corr_axys_panc_core_gsis_imputed_tbl <- map(axys_pops_with_sums_panc_core_gsis_imputed_list, cor.adi)
+corr_axys_panc_jk_glu_gsis_imputed_tbl <- map(axys_pops_with_sums_panc_jk_glu_gsis_imputed_list, cor.jk)
+corr_axys_panc_jk_leu_gsis_imputed_tbl <- map(axys_pops_with_sums_panc_jk_leu_gsis_imputed_list, cor.jk)
+corr_axys_panc_jk_fa_gsis_imputed_tbl <- map(axys_pops_with_sums_panc_jk_fa_gsis_imputed_list, cor.jk)
+corr_axys_panc_mh_glu_gsis_imputed_tbl <- map(axys_pops_with_sums_panc_mh_glu_gsis_imputed_list, cor.mh)
+
+corr_axys_panc_core_gsis_rm_outliers_tbl <- map(axys_pops_with_sums_panc_core_gsis_rm_outliers_list, cor.adi)
+corr_axys_panc_jk_glu_gsis_rm_outliers_tbl <- map(axys_pops_with_sums_panc_jk_glu_gsis_rm_outliers_list, cor.jk)
+corr_axys_panc_jk_leu_gsis_rm_outliers_tbl <- map(axys_pops_with_sums_panc_jk_leu_gsis_rm_outliers_list, cor.jk)
+corr_axys_panc_jk_fa_gsis_rm_outliers_tbl <- map(axys_pops_with_sums_panc_jk_fa_gsis_rm_outliers_list, cor.jk)
+corr_axys_panc_mh_glu_gsis_rm_outliers_tbl <- map(axys_pops_with_sums_panc_mh_glu_gsis_rm_outliers_list, cor.mh)
+
+corr_axys_panc_core_gsis_rm_389_tbl <- map(axys_pops_with_sums_panc_core_gsis_rm_389_list, cor.adi)
+corr_axys_panc_jk_glu_gsis_rm_389_tbl <- map(axys_pops_with_sums_panc_jk_glu_gsis_rm_389_list, cor.jk)
+corr_axys_panc_jk_leu_gsis_rm_389_tbl <- map(axys_pops_with_sums_panc_jk_leu_gsis_rm_389_list, cor.jk)
+corr_axys_panc_jk_fa_gsis_rm_389_tbl <- map(axys_pops_with_sums_panc_jk_fa_gsis_rm_389_list, cor.jk)
+corr_axys_panc_mh_glu_gsis_rm_389_tbl <- map(axys_pops_with_sums_panc_mh_glu_gsis_rm_389_list, cor.mh)
+
+corr_axys_panc_core_gsis_rm_419_tbl <- map(axys_pops_with_sums_panc_core_gsis_rm_419_list, cor.adi)
+corr_axys_panc_jk_glu_gsis_rm_419_tbl <- map(axys_pops_with_sums_panc_jk_glu_gsis_rm_419_list, cor.jk)
+corr_axys_panc_jk_leu_gsis_rm_419_tbl <- map(axys_pops_with_sums_panc_jk_leu_gsis_rm_419_list, cor.jk)
+corr_axys_panc_jk_fa_gsis_rm_419_tbl <- map(axys_pops_with_sums_panc_jk_fa_gsis_rm_419_list, cor.jk)
+corr_axys_panc_mh_glu_gsis_rm_419_tbl <- map(axys_pops_with_sums_panc_mh_glu_gsis_rm_419_list, cor.mh)
+
+corr_axys_panc_core_gsis_rm_448_tbl <- map(axys_pops_with_sums_panc_core_gsis_rm_448_list, cor.adi)
+corr_axys_panc_jk_glu_gsis_rm_448_tbl <- map(axys_pops_with_sums_panc_jk_glu_gsis_rm_448_list, cor.jk)
+corr_axys_panc_jk_leu_gsis_rm_448_tbl <- map(axys_pops_with_sums_panc_jk_leu_gsis_rm_448_list, cor.jk)
+corr_axys_panc_jk_fa_gsis_rm_448_tbl <- map(axys_pops_with_sums_panc_jk_fa_gsis_rm_448_list, cor.jk)
+corr_axys_panc_mh_glu_gsis_rm_448_tbl <- map(axys_pops_with_sums_panc_mh_glu_gsis_rm_448_list, cor.mh)
+
+corr_axys_adip_core_gsis_orig_tbl <- map(axys_pops_with_sums_adip_core_gsis_orig_list, cor.adi)
+corr_axys_adip_jk_glu_gsis_orig_tbl <- map(axys_pops_with_sums_adip_jk_glu_gsis_orig_list, cor.jk)
+corr_axys_adip_jk_leu_gsis_orig_tbl <- map(axys_pops_with_sums_adip_jk_leu_gsis_orig_list, cor.jk)
+corr_axys_adip_jk_fa_gsis_orig_tbl <- map(axys_pops_with_sums_adip_jk_fa_gsis_orig_list, cor.jk)
+corr_axys_adip_mh_glu_gsis_orig_tbl <- map(axys_pops_with_sums_adip_mh_glu_gsis_orig_list, cor.mh)
+
+corr_axys_adip_core_gsis_imputed_tbl <- map(axys_pops_with_sums_adip_core_gsis_imputed_list, cor.adi)
+corr_axys_adip_jk_glu_gsis_imputed_tbl <- map(axys_pops_with_sums_adip_jk_glu_gsis_imputed_list, cor.jk)
+corr_axys_adip_jk_leu_gsis_imputed_tbl <- map(axys_pops_with_sums_adip_jk_leu_gsis_imputed_list, cor.jk)
+corr_axys_adip_jk_fa_gsis_imputed_tbl <- map(axys_pops_with_sums_adip_jk_fa_gsis_imputed_list, cor.jk)
+corr_axys_adip_mh_glu_gsis_imputed_tbl <- map(axys_pops_with_sums_adip_mh_glu_gsis_imputed_list, cor.mh)
+
+corr_axys_adip_core_gsis_rm_outliers_tbl <- map(axys_pops_with_sums_adip_core_gsis_rm_outliers_list, cor.adi)
+corr_axys_adip_jk_glu_gsis_rm_outliers_tbl <- map(axys_pops_with_sums_adip_jk_glu_gsis_rm_outliers_list, cor.jk)
+corr_axys_adip_jk_leu_gsis_rm_outliers_tbl <- map(axys_pops_with_sums_adip_jk_leu_gsis_rm_outliers_list, cor.jk)
+corr_axys_adip_jk_fa_gsis_rm_outliers_tbl <- map(axys_pops_with_sums_adip_jk_fa_gsis_rm_outliers_list, cor.jk)
+corr_axys_adip_mh_glu_gsis_rm_outliers_tbl <- map(axys_pops_with_sums_adip_mh_glu_gsis_rm_outliers_list, cor.mh)
+
+corr_axys_adip_core_gsis_rm_419_tbl <- map(axys_pops_with_sums_adip_core_gsis_rm_419_list, cor.adi)
+corr_axys_adip_jk_glu_gsis_rm_419_tbl <- map(axys_pops_with_sums_adip_jk_glu_gsis_rm_419_list, cor.jk)
+corr_axys_adip_jk_leu_gsis_rm_419_tbl <- map(axys_pops_with_sums_adip_jk_leu_gsis_rm_419_list, cor.jk)
+corr_axys_adip_jk_fa_gsis_rm_419_tbl <- map(axys_pops_with_sums_adip_jk_fa_gsis_rm_419_list, cor.jk)
+corr_axys_adip_mh_glu_gsis_rm_419_tbl <- map(axys_pops_with_sums_adip_mh_glu_gsis_rm_419_list, cor.mh)
+
+corr_axys_adip_core_gsis_rm_421_tbl <- map(axys_pops_with_sums_adip_core_gsis_rm_421_list, cor.adi)
+corr_axys_adip_jk_glu_gsis_rm_421_tbl <- map(axys_pops_with_sums_adip_jk_glu_gsis_rm_421_list, cor.jk)
+corr_axys_adip_jk_leu_gsis_rm_421_tbl <- map(axys_pops_with_sums_adip_jk_leu_gsis_rm_421_list, cor.jk)
+corr_axys_adip_jk_fa_gsis_rm_421_tbl <- map(axys_pops_with_sums_adip_jk_fa_gsis_rm_421_list, cor.jk)
+corr_axys_adip_mh_glu_gsis_rm_421_tbl <- map(axys_pops_with_sums_adip_mh_glu_gsis_rm_421_list, cor.mh)
+
+# map2(corr_axys_panc_gsis_orig_tbl, names(corr_axys_panc_gsis_orig_tbl), ~ {
+#   write.csv(x = .x, file = paste0(date_today, "_", .y, "-analyte_conc_vs_GSIS", ".csv"), row.names = TRUE)
+# })
+```
+
+```{r}
+# Combine correlations before and after imputing missing values or removing outliers
+
+# Pancreas
+corr_axys_panc_core_gsis_orig_vs_imputed <- map2(corr_axys_panc_core_gsis_orig_tbl, corr_axys_panc_core_gsis_imputed_tbl, combine_correlations)
+corr_axys_panc_core_gsis_orig_vs_rm_outliers <- map2(corr_axys_panc_core_gsis_orig_tbl, corr_axys_panc_core_gsis_rm_outliers_tbl, combine_correlations)
+corr_axys_panc_core_gsis_orig_vs_rm_389 <- map2(corr_axys_panc_core_gsis_orig_tbl, corr_axys_panc_core_gsis_rm_389_tbl, combine_correlations)
+corr_axys_panc_core_gsis_orig_vs_rm_419 <- map2(corr_axys_panc_core_gsis_orig_tbl, corr_axys_panc_core_gsis_rm_419_tbl, combine_correlations)
+corr_axys_panc_core_gsis_orig_vs_rm_448 <- map2(corr_axys_panc_core_gsis_orig_tbl, corr_axys_panc_core_gsis_rm_448_tbl, combine_correlations)
+
+corr_axys_panc_jk_glu_gsis_orig_vs_imputed <- map2(corr_axys_panc_jk_glu_gsis_orig_tbl, corr_axys_panc_jk_glu_gsis_imputed_tbl, combine_correlations)
+corr_axys_panc_jk_glu_gsis_orig_vs_rm_outliers <- map2(corr_axys_panc_jk_glu_gsis_orig_tbl, corr_axys_panc_jk_glu_gsis_rm_outliers_tbl, combine_correlations)
+corr_axys_panc_jk_glu_gsis_orig_vs_rm_389 <- map2(corr_axys_panc_jk_glu_gsis_orig_tbl, corr_axys_panc_jk_glu_gsis_rm_389_tbl, combine_correlations)
+corr_axys_panc_jk_glu_gsis_orig_vs_rm_419 <- map2(corr_axys_panc_jk_glu_gsis_orig_tbl, corr_axys_panc_jk_glu_gsis_rm_419_tbl, combine_correlations)
+corr_axys_panc_jk_glu_gsis_orig_vs_rm_448 <- map2(corr_axys_panc_jk_glu_gsis_orig_tbl, corr_axys_panc_jk_glu_gsis_rm_448_tbl, combine_correlations)
+
+corr_axys_panc_jk_leu_gsis_orig_vs_imputed <- map2(corr_axys_panc_jk_leu_gsis_orig_tbl, corr_axys_panc_jk_leu_gsis_imputed_tbl, combine_correlations)
+corr_axys_panc_jk_leu_gsis_orig_vs_rm_outliers <- map2(corr_axys_panc_jk_leu_gsis_orig_tbl, corr_axys_panc_jk_leu_gsis_rm_outliers_tbl, combine_correlations)
+corr_axys_panc_jk_leu_gsis_orig_vs_rm_389 <- map2(corr_axys_panc_jk_leu_gsis_orig_tbl, corr_axys_panc_jk_leu_gsis_rm_389_tbl, combine_correlations)
+corr_axys_panc_jk_leu_gsis_orig_vs_rm_419 <- map2(corr_axys_panc_jk_leu_gsis_orig_tbl, corr_axys_panc_jk_leu_gsis_rm_419_tbl, combine_correlations)
+corr_axys_panc_jk_leu_gsis_orig_vs_rm_448 <- map2(corr_axys_panc_jk_leu_gsis_orig_tbl, corr_axys_panc_jk_leu_gsis_rm_448_tbl, combine_correlations)
+
+corr_axys_panc_jk_fa_gsis_orig_vs_imputed <- map2(corr_axys_panc_jk_fa_gsis_orig_tbl, corr_axys_panc_jk_fa_gsis_imputed_tbl, combine_correlations)
+corr_axys_panc_jk_fa_gsis_orig_vs_rm_outliers <- map2(corr_axys_panc_jk_fa_gsis_orig_tbl, corr_axys_panc_jk_fa_gsis_rm_outliers_tbl, combine_correlations)
+corr_axys_panc_jk_fa_gsis_orig_vs_rm_389 <- map2(corr_axys_panc_jk_fa_gsis_orig_tbl, corr_axys_panc_jk_fa_gsis_rm_389_tbl, combine_correlations)
+corr_axys_panc_jk_fa_gsis_orig_vs_rm_419 <- map2(corr_axys_panc_jk_fa_gsis_orig_tbl, corr_axys_panc_jk_fa_gsis_rm_419_tbl, combine_correlations)
+corr_axys_panc_jk_fa_gsis_orig_vs_rm_448 <- map2(corr_axys_panc_jk_fa_gsis_orig_tbl, corr_axys_panc_jk_fa_gsis_rm_448_tbl, combine_correlations)
+
+corr_axys_panc_mh_glu_gsis_orig_vs_imputed <- map2(corr_axys_panc_mh_glu_gsis_orig_tbl, corr_axys_panc_mh_glu_gsis_imputed_tbl, combine_correlations)
+corr_axys_panc_mh_glu_gsis_orig_vs_rm_outliers <- map2(corr_axys_panc_mh_glu_gsis_orig_tbl, corr_axys_panc_mh_glu_gsis_rm_outliers_tbl, combine_correlations)
+corr_axys_panc_mh_glu_gsis_orig_vs_rm_389 <- map2(corr_axys_panc_mh_glu_gsis_orig_tbl, corr_axys_panc_mh_glu_gsis_rm_389_tbl, combine_correlations)
+corr_axys_panc_mh_glu_gsis_orig_vs_rm_419 <- map2(corr_axys_panc_mh_glu_gsis_orig_tbl, corr_axys_panc_mh_glu_gsis_rm_419_tbl, combine_correlations)
+corr_axys_panc_mh_glu_gsis_orig_vs_rm_448 <- map2(corr_axys_panc_mh_glu_gsis_orig_tbl, corr_axys_panc_mh_glu_gsis_rm_448_tbl, combine_correlations)
+
+# Adipose
+corr_axys_adip_core_gsis_orig_vs_imputed <- map2(corr_axys_adip_core_gsis_orig_tbl, corr_axys_adip_core_gsis_imputed_tbl, combine_correlations)
+corr_axys_adip_core_gsis_orig_vs_rm_outliers <- map2(corr_axys_adip_core_gsis_orig_tbl, corr_axys_adip_core_gsis_rm_outliers_tbl, combine_correlations)
+corr_axys_adip_core_gsis_orig_vs_rm_419 <- map2(corr_axys_adip_core_gsis_orig_tbl, corr_axys_adip_core_gsis_rm_419_tbl, combine_correlations)
+corr_axys_adip_core_gsis_orig_vs_rm_421 <- map2(corr_axys_adip_core_gsis_orig_tbl, corr_axys_adip_core_gsis_rm_421_tbl, combine_correlations)
+
+corr_axys_adip_jk_glu_gsis_orig_vs_imputed <- map2(corr_axys_adip_jk_glu_gsis_orig_tbl, corr_axys_adip_jk_glu_gsis_imputed_tbl, combine_correlations)
+corr_axys_adip_jk_glu_gsis_orig_vs_rm_outliers <- map2(corr_axys_adip_jk_glu_gsis_orig_tbl, corr_axys_adip_jk_glu_gsis_rm_outliers_tbl, combine_correlations)
+corr_axys_adip_jk_glu_gsis_orig_vs_rm_419 <- map2(corr_axys_adip_jk_glu_gsis_orig_tbl, corr_axys_adip_jk_glu_gsis_rm_419_tbl, combine_correlations)
+corr_axys_adip_jk_glu_gsis_orig_vs_rm_421 <- map2(corr_axys_adip_jk_glu_gsis_orig_tbl, corr_axys_adip_jk_glu_gsis_rm_421_tbl, combine_correlations)
+
+corr_axys_adip_jk_leu_gsis_orig_vs_imputed <- map2(corr_axys_adip_jk_leu_gsis_orig_tbl, corr_axys_adip_jk_leu_gsis_imputed_tbl, combine_correlations)
+corr_axys_adip_jk_leu_gsis_orig_vs_rm_outliers <- map2(corr_axys_adip_jk_leu_gsis_orig_tbl, corr_axys_adip_jk_leu_gsis_rm_outliers_tbl, combine_correlations)
+corr_axys_adip_jk_leu_gsis_orig_vs_rm_419 <- map2(corr_axys_adip_jk_leu_gsis_orig_tbl, corr_axys_adip_jk_leu_gsis_rm_419_tbl, combine_correlations)
+corr_axys_adip_jk_leu_gsis_orig_vs_rm_421 <- map2(corr_axys_adip_jk_leu_gsis_orig_tbl, corr_axys_adip_jk_leu_gsis_rm_421_tbl, combine_correlations)
+
+corr_axys_adip_jk_fa_gsis_orig_vs_imputed <- map2(corr_axys_adip_jk_fa_gsis_orig_tbl, corr_axys_adip_jk_fa_gsis_imputed_tbl, combine_correlations)
+corr_axys_adip_jk_fa_gsis_orig_vs_rm_outliers <- map2(corr_axys_adip_jk_fa_gsis_orig_tbl, corr_axys_adip_jk_fa_gsis_rm_outliers_tbl, combine_correlations)
+corr_axys_adip_jk_fa_gsis_orig_vs_rm_419 <- map2(corr_axys_adip_jk_fa_gsis_orig_tbl, corr_axys_adip_jk_fa_gsis_rm_419_tbl, combine_correlations)
+corr_axys_adip_jk_fa_gsis_orig_vs_rm_421 <- map2(corr_axys_adip_jk_fa_gsis_orig_tbl, corr_axys_adip_jk_fa_gsis_rm_421_tbl, combine_correlations)
+
+corr_axys_adip_mh_glu_gsis_orig_vs_imputed <- map2(corr_axys_adip_mh_glu_gsis_orig_tbl, corr_axys_adip_mh_glu_gsis_imputed_tbl, combine_correlations)
+corr_axys_adip_mh_glu_gsis_orig_vs_rm_outliers <- map2(corr_axys_adip_mh_glu_gsis_orig_tbl, corr_axys_adip_mh_glu_gsis_rm_outliers_tbl, combine_correlations)
+corr_axys_adip_mh_glu_gsis_orig_vs_rm_419 <- map2(corr_axys_adip_mh_glu_gsis_orig_tbl, corr_axys_adip_mh_glu_gsis_rm_419_tbl, combine_correlations)
+corr_axys_adip_mh_glu_gsis_orig_vs_rm_421 <- map2(corr_axys_adip_mh_glu_gsis_orig_tbl, corr_axys_adip_mh_glu_gsis_rm_421_tbl, combine_correlations)
+
+```
+
+## Export results
+
+```{r}
+# Pancreas
+
+# Imputed missing values
+# map2(corr_axys_panc_core_gsis_orig_vs_imputed, names(corr_axys_panc_core_gsis_orig_vs_imputed), ~ {
+#   write.csv(x = .x, file = paste0(date_today, "_", .y, "-change_in_analyte-to-IsletCore_gsis_corr_after_imputation", ".csv"), row.names = TRUE)
+# })
+
+# map2(corr_axys_panc_jk_glu_gsis_orig_vs_imputed, names(corr_axys_panc_jk_glu_gsis_orig_vs_imputed), ~ {
+#   write.csv(x = .x, file = paste0(date_today, "_", .y, "-change_in_analyte-to-JK_glucose_perifusion_corr_after_imputation", ".csv"), row.names = TRUE)
+# })
+
+# map2(corr_axys_panc_jk_leu_gsis_orig_vs_imputed, names(corr_axys_panc_jk_leu_gsis_orig_vs_imputed), ~ {
+#   write.csv(x = .x, file = paste0(date_today, "_", .y, "-change_in_analyte-to-JK_leucine_perifusion_corr_after_imputation", ".csv"), row.names = TRUE)
+# })
+
+# map2(corr_axys_panc_jk_fa_gsis_orig_vs_imputed, names(corr_axys_panc_jk_fa_gsis_orig_vs_imputed), ~ {
+#   write.csv(x = .x, file = paste0(date_today, "_", .y, "-change_in_analyte-to-JK_fatty_acid_perifusion_corr_after_imputation", ".csv"), row.names = TRUE)
+# })
+
+# map2(corr_axys_panc_mh_glu_gsis_orig_vs_imputed, names(corr_axys_panc_mh_glu_gsis_orig_vs_imputed), ~ {
+#   write.csv(x = .x, file = paste0(date_today, "_", .y, "-change_in_analyte-to-MH_glucose_perifusion_corr_after_imputation", ".csv"), row.names = TRUE)
+# })
+
+# Removed ALL outlier donors
+# map2(corr_axys_panc_core_gsis_orig_vs_rm_outliers, names(corr_axys_panc_core_gsis_orig_vs_rm_outliers), ~ {
+#   write.csv(x = .x, file = paste0(date_today, "_", .y, "-change_in_analyte-to-IsletCore_gsis_corr_after_removing_all_outlier_donors", ".csv"), row.names = TRUE)
+# })
+ 
+# map2(corr_axys_panc_jk_glu_gsis_orig_vs_rm_outliers, names(corr_axys_panc_jk_glu_gsis_orig_vs_rm_outliers), ~ {
+#   write.csv(x = .x, file = paste0(date_today, "_", .y, "-change_in_analyte-to-JK_glucose_perifusion_corr_after_removing_all_outlier_donors", ".csv"), row.names = TRUE)
+# })
+
+# map2(corr_axys_panc_jk_leu_gsis_orig_vs_rm_outliers, names(corr_axys_panc_jk_leu_gsis_orig_vs_rm_outliers), ~ {
+#   write.csv(x = .x, file = paste0(date_today, "_", .y, "-change_in_analyte-to-JK_leucine_perifusion_corr_after_removing_all_outlier_donors", ".csv"), row.names = TRUE)
+# })
+
+# map2(corr_axys_panc_jk_fa_gsis_orig_vs_rm_outliers, names(corr_axys_panc_jk_fa_gsis_orig_vs_rm_outliers), ~ {
+#   write.csv(x = .x, file = paste0(date_today, "_", .y, "-change_in_analyte-to-JK_fatty_acid_perifusion_corr_after_removing_all_outlier_donors", ".csv"), row.names = TRUE)
+# })
+ 
+# map2(corr_axys_panc_mh_glu_gsis_orig_vs_rm_outliers, names(corr_axys_panc_mh_glu_gsis_orig_vs_rm_outliers), ~ {
+#   write.csv(x = .x, file = paste0(date_today, "_", .y, "-change_in_analyte-to-MH_glucose_perifusion_corr_after_removing_all_outlier_donors", ".csv"), row.names = TRUE)
+# })
+
+# Removed R389
+# map2(corr_axys_panc_core_gsis_orig_vs_rm_389, names(corr_axys_panc_core_gsis_orig_vs_rm_389), ~ {
+#   write.csv(x = .x, file = paste0(date_today, "_", .y, "-change_in_analyte-to-IsletCore_gsis_corr_after_removing_R389", ".csv"), row.names = TRUE)
+# })
+ 
+# map2(corr_axys_panc_jk_glu_gsis_orig_vs_rm_389, names(corr_axys_panc_jk_glu_gsis_orig_vs_rm_389), ~ {
+#   write.csv(x = .x, file = paste0(date_today, "_", .y, "-change_in_analyte-to-JK_glucose_perifusion_corr_after_removing_R389", ".csv"), row.names = TRUE)
+# })
+ 
+# map2(corr_axys_panc_jk_leu_gsis_orig_vs_rm_389, names(corr_axys_panc_jk_leu_gsis_orig_vs_rm_389), ~ {
+#   write.csv(x = .x, file = paste0(date_today, "_", .y, "-change_in_analyte-to-JK_leucine_perifusion_corr_after_removing_R389", ".csv"), row.names = TRUE)
+# })
+
+# map2(corr_axys_panc_jk_fa_gsis_orig_vs_rm_389, names(corr_axys_panc_jk_fa_gsis_orig_vs_rm_389), ~ {
+#   write.csv(x = .x, file = paste0(date_today, "_", .y, "-change_in_analyte-to-JK_fatty_acid_perifusion_corr_after_removing_R389", ".csv"), row.names = TRUE)
+# })
+ 
+# map2(corr_axys_panc_mh_glu_gsis_orig_vs_rm_389, names(corr_axys_panc_mh_glu_gsis_orig_vs_rm_389), ~ {
+#   write.csv(x = .x, file = paste0(date_today, "_", .y, "-change_in_analyte-to-MH_glucose_perifusion_corr_after_removing_R389", ".csv"), row.names = TRUE)
+# })
+
+# Removed R419
+# map2(corr_axys_panc_core_gsis_orig_vs_rm_419, names(corr_axys_panc_core_gsis_orig_vs_rm_419), ~ {
+#   write.csv(x = .x, file = paste0(date_today, "_", .y, "-change_in_analyte-to-IsletCore_gsis_corr_after_removing_R419", ".csv"), row.names = TRUE)
+# })
+ 
+# map2(corr_axys_panc_jk_glu_gsis_orig_vs_rm_419, names(corr_axys_panc_jk_glu_gsis_orig_vs_rm_419), ~ {
+#   write.csv(x = .x, file = paste0(date_today, "_", .y, "-change_in_analyte-to-JK_glucose_perifusion_corr_after_removing_R419", ".csv"), row.names = TRUE)
+# })
+
+# map2(corr_axys_panc_jk_leu_gsis_orig_vs_rm_419, names(corr_axys_panc_jk_leu_gsis_orig_vs_rm_419), ~ {
+#   write.csv(x = .x, file = paste0(date_today, "_", .y, "-change_in_analyte-to-JK_leucine_perifusion_corr_after_removing_R419", ".csv"), row.names = TRUE)
+# })
+
+# map2(corr_axys_panc_jk_fa_gsis_orig_vs_rm_419, names(corr_axys_panc_jk_fa_gsis_orig_vs_rm_419), ~ {
+#   write.csv(x = .x, file = paste0(date_today, "_", .y, "-change_in_analyte-to-JK_fatty_acid_perifusion_corr_after_removing_R419", ".csv"), row.names = TRUE)
+# })
+
+# map2(corr_axys_panc_mh_glu_gsis_orig_vs_rm_419, names(corr_axys_panc_mh_glu_gsis_orig_vs_rm_419), ~ {
+#   write.csv(x = .x, file = paste0(date_today, "_", .y, "-change_in_analyte-to-MH_glucose_perifusion_corr_after_removing_R419", ".csv"), row.names = TRUE)
+# })
+
+# Removed R448
+# map2(corr_axys_panc_core_gsis_orig_vs_rm_448, names(corr_axys_panc_core_gsis_orig_vs_rm_448), ~ {
+#   write.csv(x = .x, file = paste0(date_today, "_", .y, "-change_in_analyte-to-IsletCore_gsis_corr_after_removing_R448", ".csv"), row.names = TRUE)
+# })
+
+# map2(corr_axys_panc_jk_glu_gsis_orig_vs_rm_448, names(corr_axys_panc_jk_glu_gsis_orig_vs_rm_448), ~ {
+#   write.csv(x = .x, file = paste0(date_today, "_", .y, "-change_in_analyte-to-JK_glucose_perifusion_corr_after_removing_R448", ".csv"), row.names = TRUE)
+# })
+
+# map2(corr_axys_panc_jk_leu_gsis_orig_vs_rm_448, names(corr_axys_panc_jk_leu_gsis_orig_vs_rm_448), ~ {
+#   write.csv(x = .x, file = paste0(date_today, "_", .y, "-change_in_analyte-to-JK_leucine_perifusion_corr_after_removing_R448", ".csv"), row.names = TRUE)
+# })
+
+# map2(corr_axys_panc_jk_fa_gsis_orig_vs_rm_448, names(corr_axys_panc_jk_fa_gsis_orig_vs_rm_448), ~ {
+#   write.csv(x = .x, file = paste0(date_today, "_", .y, "-change_in_analyte-to-JK_fatty_acid_perifusion_corr_after_removing_R448", ".csv"), row.names = TRUE)
+# })
+
+# map2(corr_axys_panc_mh_glu_gsis_orig_vs_rm_448, names(corr_axys_panc_mh_glu_gsis_orig_vs_rm_448), ~ {
+#   write.csv(x = .x, file = paste0(date_today, "_", .y, "-change_in_analyte-to-MH_glucose_perifusion_corr_after_removing_R448", ".csv"), row.names = TRUE)
+# })
+```
+
+```{r}
+# Adipose
+
+# Imputed missing values
+# map2(corr_axys_adip_core_gsis_orig_vs_imputed, names(corr_axys_adip_core_gsis_orig_vs_imputed), ~ {
+#   write.csv(x = .x, file = paste0(date_today, "_", .y, "-change_in_analyte-to-IsletCore_gsis_corr_after_imputation", ".csv"), row.names = TRUE)
+# })
+# 
+# map2(corr_axys_adip_jk_glu_gsis_orig_vs_imputed, names(corr_axys_adip_jk_glu_gsis_orig_vs_imputed), ~ {
+#   write.csv(x = .x, file = paste0(date_today, "_", .y, "-change_in_analyte-to-JK_glucose_perifusion_corr_after_imputation", ".csv"), row.names = TRUE)
+# })
+# 
+# map2(corr_axys_adip_jk_leu_gsis_orig_vs_imputed, names(corr_axys_adip_jk_leu_gsis_orig_vs_imputed), ~ {
+#   write.csv(x = .x, file = paste0(date_today, "_", .y, "-change_in_analyte-to-JK_leucine_perifusion_corr_after_imputation", ".csv"), row.names = TRUE)
+# })
+# 
+# map2(corr_axys_adip_jk_fa_gsis_orig_vs_imputed, names(corr_axys_adip_jk_fa_gsis_orig_vs_imputed), ~ {
+#   write.csv(x = .x, file = paste0(date_today, "_", .y, "-change_in_analyte-to-JK_fatty_acid_perifusion_corr_after_imputation", ".csv"), row.names = TRUE)
+# })
+# 
+# map2(corr_axys_adip_mh_glu_gsis_orig_vs_imputed, names(corr_axys_adip_mh_glu_gsis_orig_vs_imputed), ~ {
+#   write.csv(x = .x, file = paste0(date_today, "_", .y, "-change_in_analyte-to-MH_glucose_perifusion_corr_after_imputation", ".csv"), row.names = TRUE)
+# })
+
+# Removed ALL outlier donors
+# map2(corr_axys_adip_core_gsis_orig_vs_rm_outliers, names(corr_axys_adip_core_gsis_orig_vs_rm_outliers), ~ {
+#   write.csv(x = .x, file = paste0(date_today, "_", .y, "-change_in_analyte-to-IsletCore_gsis_corr_after_removing_all_outlier_donors", ".csv"), row.names = TRUE)
+# })
+# 
+# map2(corr_axys_adip_jk_glu_gsis_orig_vs_rm_outliers, names(corr_axys_adip_jk_glu_gsis_orig_vs_rm_outliers), ~ {
+#   write.csv(x = .x, file = paste0(date_today, "_", .y, "-change_in_analyte-to-JK_glucose_perifusion_corr_after_removing_all_outlier_donors", ".csv"), row.names = TRUE)
+# })
+# 
+# map2(corr_axys_adip_jk_leu_gsis_orig_vs_rm_outliers, names(corr_axys_adip_jk_leu_gsis_orig_vs_rm_outliers), ~ {
+#   write.csv(x = .x, file = paste0(date_today, "_", .y, "-change_in_analyte-to-JK_leucine_perifusion_corr_after_removing_all_outlier_donors", ".csv"), row.names = TRUE)
+# })
+# 
+# map2(corr_axys_adip_jk_fa_gsis_orig_vs_rm_outliers, names(corr_axys_adip_jk_fa_gsis_orig_vs_rm_outliers), ~ {
+#   write.csv(x = .x, file = paste0(date_today, "_", .y, "-change_in_analyte-to-JK_fatty_acid_perifusion_corr_after_removing_all_outlier_donors", ".csv"), row.names = TRUE)
+# })
+# 
+# map2(corr_axys_adip_mh_glu_gsis_orig_vs_rm_outliers, names(corr_axys_adip_mh_glu_gsis_orig_vs_rm_outliers), ~ {
+#   write.csv(x = .x, file = paste0(date_today, "_", .y, "-change_in_analyte-to-MH_glucose_perifusion_corr_after_removing_all_outlier_donors", ".csv"), row.names = TRUE)
+# })
+
+# Removed R419
+# map2(corr_axys_adip_core_gsis_orig_vs_rm_419, names(corr_axys_adip_core_gsis_orig_vs_rm_419), ~ {
+#   write.csv(x = .x, file = paste0(date_today, "_", .y, "-change_in_analyte-to-IsletCore_gsis_corr_after_removing_R419", ".csv"), row.names = TRUE)
+# })
+# 
+# map2(corr_axys_adip_jk_glu_gsis_orig_vs_rm_419, names(corr_axys_adip_jk_glu_gsis_orig_vs_rm_419), ~ {
+#   write.csv(x = .x, file = paste0(date_today, "_", .y, "-change_in_analyte-to-JK_glucose_perifusion_corr_after_removing_R419", ".csv"), row.names = TRUE)
+# })
+# 
+# map2(corr_axys_adip_jk_leu_gsis_orig_vs_rm_419, names(corr_axys_adip_jk_leu_gsis_orig_vs_rm_419), ~ {
+#   write.csv(x = .x, file = paste0(date_today, "_", .y, "-change_in_analyte-to-JK_leucine_perifusion_corr_after_removing_R419", ".csv"), row.names = TRUE)
+# })
+# 
+# map2(corr_axys_adip_jk_fa_gsis_orig_vs_rm_419, names(corr_axys_adip_jk_fa_gsis_orig_vs_rm_419), ~ {
+#   write.csv(x = .x, file = paste0(date_today, "_", .y, "-change_in_analyte-to-JK_fatty_acid_perifusion_corr_after_removing_R419", ".csv"), row.names = TRUE)
+# })
+# 
+# map2(corr_axys_adip_mh_glu_gsis_orig_vs_rm_419, names(corr_axys_adip_mh_glu_gsis_orig_vs_rm_419), ~ {
+#   write.csv(x = .x, file = paste0(date_today, "_", .y, "-change_in_analyte-to-MH_glucose_perifusion_corr_after_removing_R419", ".csv"), row.names = TRUE)
+# })
+
+# Removed R421
+# map2(corr_axys_adip_core_gsis_orig_vs_rm_421, names(corr_axys_adip_core_gsis_orig_vs_rm_421), ~ {
+#   write.csv(x = .x, file = paste0(date_today, "_", .y, "-change_in_analyte-to-IsletCore_gsis_corr_after_removing_R421", ".csv"), row.names = TRUE)
+# })
+# 
+# map2(corr_axys_adip_jk_glu_gsis_orig_vs_rm_421, names(corr_axys_adip_jk_glu_gsis_orig_vs_rm_421), ~ {
+#   write.csv(x = .x, file = paste0(date_today, "_", .y, "-change_in_analyte-to-JK_glucose_perifusion_corr_after_removing_R421", ".csv"), row.names = TRUE)
+# })
+# 
+# map2(corr_axys_adip_jk_leu_gsis_orig_vs_rm_421, names(corr_axys_adip_jk_leu_gsis_orig_vs_rm_421), ~ {
+#   write.csv(x = .x, file = paste0(date_today, "_", .y, "-change_in_analyte-to-JK_leucine_perifusion_corr_after_removing_R421", ".csv"), row.names = TRUE)
+# })
+# 
+# map2(corr_axys_adip_jk_fa_gsis_orig_vs_rm_421, names(corr_axys_adip_jk_fa_gsis_orig_vs_rm_421), ~ {
+#   write.csv(x = .x, file = paste0(date_today, "_", .y, "-change_in_analyte-to-JK_fatty_acid_perifusion_corr_after_removing_R421", ".csv"), row.names = TRUE)
+# })
+# 
+# map2(corr_axys_adip_mh_glu_gsis_orig_vs_rm_421, names(corr_axys_adip_mh_glu_gsis_orig_vs_rm_421), ~ {
+#   write.csv(x = .x, file = paste0(date_today, "_", .y, "-change_in_analyte-to-MH_glucose_perifusion_corr_after_removing_R421", ".csv"), row.names = TRUE)
+# })
+```
+
+# Session Info
+
+```{r}
+sessionInfo()
+```
+

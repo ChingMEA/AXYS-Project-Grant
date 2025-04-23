@@ -1,0 +1,306 @@
+---
+title: "AXYS correlation analysis using imputed values"
+author: "Angela Ching"
+date: "`r Sys.Date()`"
+output: 
+  html_notebook:
+    toc: yes
+---
+
+# Packages
+
+```{r packages}
+library(tidyverse)
+library(readxl)
+library(ggplot2)
+library(janitor)      # for data cleaning
+library(scico)        # colour palettes
+library(ggsci)        # colour palettes
+library(ggpubr)       # for scatterplot correlations
+library(psychometric) # masks "select" from dplyr; for CIr()
+library(purrr)        # for mapping heatmaps
+library(reshape2)     # for reshaping data for heatmaps
+library(knitr)
+library(pheatmap)
+library(corrplot)
+library(psych)
+library(lme4)
+```
+
+
+# Custom functions
+
+```{r correlation_tests}
+# Correlation tests
+
+cor.mtest <- function(df, method = "kendall", ...) {
+    n <- ncol(df)
+    mat <- as.matrix(df[, 2:n])
+    cor <- psych::corTest(mat, method = method, adjust = "fdr", use = "pairwise")
+    cormat <- as.matrix(cor$r)
+    pmat <- as.matrix(cor$p)
+    return(list(cormat, pmat, cor))
+}
+
+# Flatten correlation matrix
+cor.flat <- function(df, method = "kendall", ...) {
+  n <- ncol(df)
+  mat <- as.matrix(df[, 2:n])
+  cor <- psych::corTest(mat, method = method, adjust = "fdr", use = "pairwise")
+    
+  # Convert p matrix to a data frame
+  p_df <- as.data.frame(cor$p)
+  p_df$row <- rownames(p_df)
+  
+  # Convert r matrix to a data frame
+  r_df <- as.data.frame(cor$r)
+  r_df$row <- rownames(r_df)
+  
+  # Melt the p matrix
+  melted_p <- melt(p_df, id.vars = c("row"), variable.name = "column", value.name = "p")
+  
+  # Melt the r matrix
+  melted_r <- melt(r_df, id.vars = c("row"), variable.name = "column", value.name = "r")
+  
+  # Combine the melted p and r data frames
+  final_data <- left_join(melted_r, melted_p, by = c("row", "column")) %>%
+  distinct(row, column, .keep_all = TRUE) %>%
+  mutate(p_adj = p.adjust(.$p, method = "fdr"))
+  
+  return(final_data)
+}
+
+# Correlation matrix for plotting in Prism
+cor.flat.for.mh <- function(df, method = "kendall", ...) {
+  n <- ncol(df)
+  mat <- as.matrix(df[, 2:n])
+  cor_result <- psych::corTest(mat, method = method, use = "pairwise")
+  
+  # Extract Kendall's r values
+  r_values <- cor_result$r
+  
+  # Keep only the upper triangle and diagonal elements
+  upper_triangle <- upper.tri(r_values, diag = TRUE)
+  r_values[!upper_triangle] <- NA
+  
+  # Convert r matrix to a data frame
+  r_df <- as.data.frame(r_values)
+  
+  return(r_df)
+}
+```
+
+```{r}
+# Colour palettes
+col <- colorRampPalette(c("#BB4444", "#EE9988", "#FFFFFF", "#77AADD", "#4477AA"))
+custom_palette <- c("#BB4444", "#EE9988", "#FFFFFF", "#77AADD", "#4477AA")
+
+# Plot correlation
+plot_correlation <- function(corrplot_data, index) {
+  corrplot(corrplot_data[[1]], type = "upper", order = "original", method = "circle", cl.align.text = "l", diag = FALSE,
+           addCoef.col = 'grey20', sig.level = 1, insig = 'blank',
+           number.cex = 0.5, p.mat = corrplot_data[[2]], tl.col = "black", tl.srt = 45, tl.cex = 0.75)
+}
+
+# Generate and save correlation plots with flexible parameters
+generate_and_save_corrplot <- function(filename, corrplot_data, width, height, show_legend = TRUE) {
+  png(filename = filename, width = width, height = height, units = "in", res = 600)
+  
+  # Conditional cl.pos based on show_legend argument
+  legend_position <- ifelse(show_legend, "l", "n")
+  
+  corrplot(corrplot_data[[1]], type = "upper", order = "original", method = "circle", 
+           cl.align.text = legend_position, diag = FALSE, 
+           addCoef.col = 'gray20', sig.level = 1, insig = 'blank', col = col(10),
+           number.cex = 0.5, p.mat = corrplot_data[[2]], tl.col = "black", tl.srt = 45, tl.cex = 0.75,
+           cl.pos = legend_position)
+  
+  dev.off()
+}
+```
+
+```{r}
+# Function for making correlation tables (x axis titles at a 45 degree angle)
+plot_table <- function(data) {
+  ggplot(data, aes(row, column, fill = r)) +
+    geom_tile() +
+    theme_minimal() +
+    scale_fill_gradientn(colors = custom_palette, limits = c(-1, 1)) +
+    # Additional scale_fill functions can be added here if needed
+    theme(panel.grid = element_blank(),
+          axis.title.x = element_blank(),
+          axis.title.y = element_blank(),
+          legend.spacing.y = unit(0.5, 'cm'),
+          legend.title = element_text(size = 10),
+          axis.text.x = element_text(size = 10, hjust = 1, angle = 45,  vjust = 1),
+          axis.text.y = element_text(size = 10)) +
+    geom_text(aes(label = round(r, 2)), color = "black", size = 2.5) +
+    labs(fill = str_wrap("Kendall's coefficient", width = 12))
+}
+
+# Tables for correlations with donor characteristics (horizontal x axis titles)
+plot_table_meta <- function(data) {
+  ggplot(data, aes(row, column, fill = r)) +
+    geom_tile() +
+    theme_minimal() +
+    scale_fill_gradientn(colors = custom_palette, limits = c(-1, 1)) +
+    theme(panel.grid = element_blank(),
+          axis.title.x = element_blank(),
+          axis.title.y = element_blank(),
+          legend.spacing.y = unit(0.5, 'cm'),
+          legend.title = element_text(size = 10),
+          axis.text.x = element_text(size = 10, hjust = 0.5, angle = 0,  vjust = 1),
+          axis.text.y = element_text(size = 10)) +
+    geom_text(aes(label = round(r, 2)), color = "black", size = 2.5) +
+    labs(fill = str_wrap("Kendall's coefficient", width = 12))
+}
+```
+
+```{r}
+# Functions for performing Kendall correlations and filtering rows and columns by lab or data type
+cor.mh <- function(df) {
+  df %>%
+    cor.flat() %>%
+    dplyr::filter(!str_detect(row, "MH"), str_detect(column, "MH"))
+}
+
+cor.jk <- function(df) {
+  df %>%
+    cor.flat() %>%
+    dplyr::filter(!str_detect(row, "JK"), str_detect(column, "JK"))
+}
+
+cor.adi <- function(df) {
+  df %>%
+    cor.flat() %>%
+    dplyr::filter(!str_detect(row, "IsletCore"), str_detect(column, "IsletCore"))
+}
+
+cor.meta <- function(df) {
+  df %>%
+    cor.flat() %>%
+    dplyr::filter((row == "Age" | row == "BMI" | row == "Hba1c") &
+         !(column == "Age" | column == "BMI" | column == "Hba1c"))
+}
+```
+
+```{r}
+combine_correlations <- function(initial_corr, new_corr) {
+  # Left join the two correlation tables based on 'row' and 'column'
+  combined_corr <- dplyr::left_join(initial_corr, new_corr, by = c("row", "column"), suffix = c("_initial", "_new"))
+  
+  # Calculate the absolute percent change in r and add it as a new column
+  combined_corr <- combined_corr %>%
+    mutate(percent_change_r = round(abs((r_new - r_initial) / r_initial) * 100, 2),
+           percent_change_r_dir = round((r_new - r_initial) / abs(r_initial) * 100, 2))
+  
+  return(combined_corr)
+}
+```
+
+```{r}
+# Save correlation matrices for export to prism
+save_correlation_matrices <- function(correlation_list, date_today) {
+  # Iterate over the outer list with imap
+  imap(correlation_list, ~ {
+    # Iterate over each sublist with imap
+    imap(.x, ~ {
+      # Create the file name for each element in the sublist
+      file_name <- paste0(date_today, "_", .y, "_", .y, ".csv")
+      # Write the CSV file
+      write.csv(x = .x, file = file_name, row.names = TRUE)
+    })
+  })
+}
+```
+
+# Load AXYS data
+
+```{r}
+# load chemical list
+chem_list_2 <- read_csv("../../data/2024-10-01_AXYS_chemicals_list_with_coelutions.csv") %>%
+  dplyr::select(-c(Dioxin_subtype, Type))
+
+# load AXYS donor metadata
+axys_metadata <- read_csv("../../data/2024-08-22_donor_characteristics_FINAL.csv", show_col_types = FALSE) %>%
+  mutate(BMI_category = case_when(BMI < 24.9 ~ "Lean",
+                                  BMI >= 24.9 & BMI <= 29.9 ~ "Overweight",
+                                  BMI > 29.9 ~ "Obese"),
+         Hba1c_category = case_when(Hba1c < 6 ~ "Normoglycemic",
+                                    Hba1c <= 6.5 ~ "Prediabetic",
+                                    Hba1c > 6.5 ~ "Diabetic"),
+         BMI_category = factor(BMI_category, levels = c("Lean", "Overweight", "Obese")),
+         Hba1c_category = factor(Hba1c_category, levels = c("Normoglycemic", "Prediabetic", "Diabetic")),
+         Sex = as_factor(Sex),
+         Diabetes_status = as_factor(Diabetes_status)) %>%
+  dplyr::select(-Purity)
+
+# Donor IDs
+axys_donors <- axys_metadata %>%
+  dplyr::select(Id)
+
+# load AXYS data with imputed values for true NAs (chemicals not measured by AXYS in certain donors)
+axys_pops_imputed_panc <- read_excel("../../outputs/2024-09-03_axys_pops_includes_imputed_values_for_true_NAs_using_mice_package.xlsx", sheet = 1)
+
+axys_pops_imputed_adip <- read_excel("../../outputs/2024-09-03_axys_pops_includes_imputed_values_for_true_NAs_using_mice_package.xlsx", sheet = 2)
+
+```
+
+# Sums
+
+```{r}
+# Calculate sums using imputed dataset
+axys_pops_imputed_panc_sums <- axys_pops_imputed_panc %>%
+  pivot_longer(cols = c(2:34), names_to = "COMPOUND", values_to = "ADJ_CONC") %>%
+  left_join(., chem_list_2, by = c("COMPOUND" = "Compound")) %>%
+  group_by(DONOR, Dioxin_similarity) %>%
+  mutate(AnalyteSums = sum(ADJ_CONC)) %>%
+  ungroup() %>%
+  group_by(DONOR, Dioxin_similarity, AnalyteSums) %>%
+  summarise() %>%
+  pivot_wider(names_from = Dioxin_similarity, values_from = AnalyteSums) %>%
+  mutate(PCB = rowSums(across(c("Dioxin-like", "Non-dioxin-like")))) %>%
+  dplyr::select(-OCP) %>%
+  relocate(DONOR, Dioxin, PCB) %>%
+  ungroup()
+
+axys_pops_imputed_adip_sums <- axys_pops_imputed_adip %>%
+  pivot_longer(cols = c(2:42), names_to = "COMPOUND", values_to = "ADJ_CONC") %>%
+  left_join(., chem_list_2, by = c("COMPOUND" = "Compound")) %>%
+  group_by(DONOR, Dioxin_similarity) %>%
+  mutate(AnalyteSums = sum(ADJ_CONC)) %>%
+  ungroup() %>%
+  group_by(DONOR, Dioxin_similarity, AnalyteSums) %>%
+  summarise() %>%
+  pivot_wider(names_from = Dioxin_similarity, values_from = AnalyteSums) %>%
+  mutate(PCB = rowSums(across(c("Dioxin-like", "Non-dioxin-like")))) %>%
+  dplyr::select(-OCP) %>%
+  relocate(DONOR, Dioxin, PCB) %>%
+  ungroup()
+```
+
+```{r}
+# Combine with sums and metadata
+axys_pops_meta_panc <- axys_pops_panc %>%
+  left_join(., axys_metadata, by = c("DONOR" = "Id")) %>%
+  dplyr::select(-Hba1c_category)
+
+axys_pops_meta_adip <- axys_pops_adip %>%
+  left_join(., axys_metadata, by = c("DONOR" = "Id")) %>%
+  dplyr::select(-Hba1c_category)
+
+axys_pops_meta_panc_imputed <- axys_pops_imputed_panc %>%
+  left_join(., axys_pops_imputed_panc_sums, by = c("DONOR" = "DONOR")) %>%
+  left_join(., axys_metadata, by = c("DONOR" = "Id")) %>%
+  dplyr::select(-Hba1c_category)
+
+axys_pops_meta_adip_imputed <- axys_pops_imputed_adip %>%
+  left_join(., axys_pops_imputed_adip_sums, by = c("DONOR" = "DONOR")) %>%
+  left_join(., axys_metadata, by = c("DONOR" = "Id")) %>%
+  dplyr::select(-Hba1c_category)
+```
+
+## Correlate concentrations of each analyte with each other within each tissue
+
+
+

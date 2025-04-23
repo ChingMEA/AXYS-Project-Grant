@@ -1,0 +1,847 @@
+---
+title: "AXYS Project Grant: Sensitivity analyses and linear modelling"
+author: "Angela Ching"
+date: "`r Sys.Date()`"
+output: 
+  html_notebook:
+    toc: yes
+---
+
+# Notes from MH
+
+IsletCore GSIS:
+- Condition #1 = LG 2.8mM, HG 16.7mM 
+- Condition #2 = LG 1mM, HG 16.7mM
+- Condition #3 = LG 1mM, HG 10mM
+
+Perifusion:
+- Exclude KCl for donors: R361, R362, R385, R391 (already removed from final excel)
+- Only use basal LG (exclude the rest of perifusion curve) for donors: R419, R421 (already removed from final excel)
+- Do sensitivity analysis with donor R417
+
+Exclusion criteria
+- Remove any analyte with >50% donors below LOD
+- Remove any analyte with >40% of donors with NDR flag
+
+```{r}
+# Get today's date for saving plots
+date_today <- Sys.Date()
+```
+
+# Packages
+
+```{r packages}
+library(tidyverse)
+library(readxl)
+library(ggplot2)
+library(janitor)      # for data cleaning
+library(scico)        # colour palettes
+library(ggsci)        # colour palettes
+library(ggpubr)       # for scatterplot correlations
+library(psychometric) # masks "select" from dplyr; for CIr()
+library(purrr)        # for mapping heatmaps
+library(reshape2)     # for reshaping data for heatmaps
+library(knitr)
+library(pheatmap)
+library(corrplot)
+library(psych)
+library(lme4)
+library(moments)
+library(gridExtra)
+```
+
+# Sensitivity analyses
+
+## Load data
+
+```{r}
+# Combine all correlation files into one dataframe
+compiled_outputs <- suppressWarnings(
+  map_dfr(.x = list.files(path = "../../outputs/2024-10-02_ProjectGrant_sensitivity_analyses",
+                                      recursive = TRUE,
+                                      pattern = ".csv",
+                                      full.names = TRUE),
+          .f = ~read_csv(.x) %>%
+            dplyr::mutate(Filename = str_remove(basename(.x), ".csv")),
+          
+          # Add a number to identify which rows came from the same file
+          .id = "File"))
+
+compounds_n <- read_xlsx(path = "../../data/2024-10-03_List_of_compounds_with_sample_size.xlsx") %>%
+  mutate(across(c(4:ncol(.)), as.numeric))
+
+# compounds_n_panc <- compounds_n %>%
+#   dplyr::filter(TISSUE_TYPE == "Pancreas") %>%
+#   dplyr::select(-n_rm_421)
+# 
+# compounds_n_adip <- compounds_n %>%
+#   dplyr::filter(TISSUE_TYPE == "Adipose") %>%
+#   dplyr::select(-c(n_rm_389, n_rm_448))
+
+pops_rchange <- compiled_outputs %>%
+  dplyr::select(-2) %>%
+  mutate(Comparison = case_when(str_detect(Filename, pattern = "analyte-to-metadata") ~ "analyte_vs_metadata",
+                                str_detect(Filename, pattern = "gsis") ~ "analyte_vs_gsis",
+                                str_detect(Filename, pattern = "perifusion") ~ "analyte_vs_gsis"),
+         Pollutant_class = case_when(str_detect(Filename, pattern = "dioxin") ~ "Dioxin",
+                                str_detect(Filename, pattern = "pcb") ~ "PCB",
+                                str_detect(Filename, pattern = "ocp") ~ "OCP"),
+         Tissue_type = case_when(str_detect(Filename, pattern = "panc") ~ "Pancreas",
+                                str_detect(Filename, pattern = "adip") ~ "Adipose"),
+         GSIS_type = case_when(str_detect(Filename, pattern = "IsletCore") ~ "IsletCore_static_GSIS",
+                               str_detect(Filename, pattern = "JK_glu") ~ "JK_glucose_perifusion",
+                               str_detect(Filename, pattern = "JK_leu") ~ "JK_leucine_perifusion",
+                               str_detect(Filename, pattern = "JK_fatty_acid") ~ "JK_fatty_acid_perifusion",
+                               str_detect(Filename, pattern = "MH") ~ "MH_glucose_perifusion"),
+         Correction_type = case_when(str_detect(Filename, pattern = "imput") ~ "imputation",
+                               str_detect(Filename, pattern = "removing_all_outlier") ~ "removed_all_outlier_donors",
+                               str_detect(Filename, pattern = "R389") ~ "removed_R389",
+                               str_detect(Filename, pattern = "R419") ~ "removed_R419",
+                               str_detect(Filename, pattern = "R421") ~ "removed_R421",
+                               str_detect(Filename, pattern = "R448") ~ "removed_R448")) %>%
+  relocate(File, Tissue_type, Comparison, Pollutant_class, GSIS_type, Correction_type)
+
+
+pops_rchange_n <- pops_rchange %>%
+  left_join(., compounds_n, by = c("Tissue_type" = "TISSUE_TYPE", "column" = "COMPOUND")) %>%
+  left_join(., compounds_n, by = c("Tissue_type" = "TISSUE_TYPE", "row" = "COMPOUND")) %>%
+  mutate(n = coalesce(n.x, n.y),
+         n_rm_all = coalesce(n_rm_all.x, n_rm_all.y),
+         n_rm_389 = coalesce(n_rm_389.x, n_rm_389.y),
+         n_rm_419 = coalesce(n_rm_419.x, n_rm_419.y),
+         n_rm_421 = coalesce(n_rm_421.x, n_rm_421.y),
+         n_rm_448 = coalesce(n_rm_448.x, n_rm_448.y),
+         .keep = c("unused")) %>%
+  dplyr::select(-c(Type.x, Type.y))
+```
+
+## Calculate range change in r
+
+```{r}
+summary_rchange <- pops_rchange_n %>%
+  group_by(File, Tissue_type, Comparison, Pollutant_class, GSIS_type, Correction_type) %>%
+  summarise(
+    r_min = min(r_difference, na.rm = TRUE),
+    r_max = max(r_difference, na.rm = TRUE)
+  )
+```
+
+```{r}
+# Filter only r changes > 0.1
+pops_rdiff_filt <- pops_rchange %>%
+  dplyr::filter(r_difference > 0.1)
+```
+
+## Statistical testing
+
+```{r}
+##### Need to separate files by analysis Correction_type ######
+correction_type <- pops_rchange_n %>%
+  distinct(Correction_type) %>%
+  pull(Correction_type)
+
+pops_rchange_panc <- pops_rchange_n %>%
+  dplyr::filter(Tissue_type == "Pancreas")
+
+pops_rchange_adip <- pops_rchange_n %>%
+  dplyr::filter(Tissue_type == "Adipose")
+
+adip_rm_421 <- pops_rchange_adip %>%
+  rowwise() %>%
+  mutate(
+    z_initial = 0.5 * log((1 + r_initial) / (1 - r_initial)),
+    z_new = 0.5 * log((1 + r_new) / (1 - r_new)),
+    z_diff = abs(z_initial - z_new),
+    se = sqrt(1 / (n - 3) + 1 / (n_rm_421 - 3)),  # Assuming you have n_initial and n_new as sample sizes
+    z_stat = z_diff / se,
+    p_value = 2 * pnorm(-abs(z_stat))  # Two-tailed test
+  ) %>%
+  dplyr::filter(p_value < 0.05)
+```
+
+# Linear modelling
+
+## Load AXYS pollutant concentration data and metadata
+
+```{r}
+# load AXYS data
+axys_pops <- read_csv("../../outputs/2024-08-24_ProjectGrant_excluded_outliers_for_single_analyte_analyses.csv") %>%
+  dplyr::select(-c(CONC_BLANK_adj, IS_BLANK_ADJ_CONC_HIGHER_THAN_LOD)) %>%
+  mutate(BLANK_and_LOD_adj = as.numeric(BLANK_and_LOD_adj),
+         File = factor(File),
+         COMPOUND = case_when(str_detect(COMPOUND, "TOTAL") ~ str_to_sentence(COMPOUND),
+                              str_detect(COMPOUND, " Epoxide") ~ str_to_sentence(COMPOUND),
+                              TRUE ~ COMPOUND),
+         across(where(is.character), str_squish))
+
+axys_pops_2 <- axys_pops %>%
+  dplyr::select(-c(File, LAB_FLAG, DETECTION_LIMIT)) %>%
+  mutate(across(where(is.character), str_squish),
+         COMPOUND = make.names(COMPOUND),
+         COMPOUND = str_replace_all(COMPOUND, "\\.", "_"),
+         COMPOUND = str_replace_all(COMPOUND, "__+", "_"))
+
+# load chemical list
+chem_list <- read_csv("../../data/2022-10-18_AXYS_chemicals_list_AC.csv") %>%
+  dplyr::select(Compound, Dioxin_subtype) %>%
+  mutate(across(where(is.character), str_squish))
+
+# chem_list_2 <- read_csv("../../data/2024-10-01_AXYS_chemicals_list_with_coelutions.csv") %>%
+#   dplyr::select(-c(Dioxin_subtype, Type)) %>%
+#   mutate(across(where(is.character), str_squish),
+#          Compound = make.names(Compound))
+
+chem_list_2 <- read_csv("../../data/2024-10-01_AXYS_chemicals_list_with_coelutions.csv") %>%
+  dplyr::select(-c(Dioxin_subtype, Type, Compound_rename)) %>%
+  mutate(across(where(is.character), str_squish),
+         Compound = make.names(Compound),
+         Compound = str_replace_all(Compound, "\\.", "_"),
+         Compound = str_replace_all(Compound, "__+", "_"))
+
+# load AXYS donor metadata
+axys_metadata <- read_csv("../../data/2024-08-22_donor_characteristics_FINAL.csv", show_col_types = FALSE) %>%
+  mutate(BMI_category = case_when(BMI < 24.9 ~ "Lean",
+                                  BMI >= 24.9 & BMI <= 29.9 ~ "Overweight",
+                                  BMI > 29.9 ~ "Obese"),
+         Hba1c_category = case_when(Hba1c < 6 ~ "Normoglycemic",
+                                    Hba1c <= 6.5 ~ "Prediabetic",
+                                    Hba1c > 6.5 ~ "Diabetic"),
+         BMI_category = factor(BMI_category, levels = c("Lean", "Overweight", "Obese")),
+         Hba1c_category = factor(Hba1c_category, levels = c("Normoglycemic", "Prediabetic", "Diabetic")),
+         Sex = as_factor(Sex),
+         Diabetes_status = as_factor(Diabetes_status)) %>%
+  dplyr::select(-Purity)
+
+# Donor IDs
+axys_donors <- axys_metadata %>%
+  dplyr::select(Id)
+
+# Main correlations to explore with linear model corrections
+axys_main_corr <- read_excel("../../data/2024-11-07_ComparisonList_AXYS_linear_models_adjustments.xlsx", sheet = 1) %>%
+  dplyr::select(-Comparison_with)
+
+# Subset data by tissue type
+subset_tissue <- function(tissue) {
+  axys_pops_2 %>%
+    dplyr::filter(!str_detect(COMPOUND, "Total"), TISSUE_TYPE == tissue) %>%
+    dplyr::select(DONOR, COMPOUND, BLANK_and_LOD_adj) %>%
+    group_by(DONOR) %>%
+    pivot_wider(names_from = COMPOUND, values_from = BLANK_and_LOD_adj) %>%
+    ungroup()
+}
+
+axys_pops_panc <- subset_tissue("Pancreas")
+axys_pops_adip <- subset_tissue("Adipose")
+```
+
+```{r}
+# Calculate sums
+axys_panc_sums <- axys_pops_panc %>%
+  pivot_longer(cols = c(2:ncol(.)), names_to = "COMPOUND", values_to = "ADJ_CONC") %>%
+  left_join(., chem_list_2, by = c("COMPOUND" = "Compound")) %>%
+  group_by(DONOR, Dioxin_similarity) %>%
+  mutate(AnalyteSums = sum(ADJ_CONC, na.rm = TRUE)) %>%
+  ungroup() %>%
+  group_by(DONOR, Dioxin_similarity, AnalyteSums) %>%
+  summarise() %>%
+  pivot_wider(names_from = Dioxin_similarity, values_from = AnalyteSums) %>%
+  mutate(PCB = rowSums(across(c("Dioxin-like", "Non-dioxin-like")))) %>%
+  dplyr::select(-OCP) %>%
+  relocate(DONOR, Dioxin, PCB) %>%
+  ungroup()
+
+axys_adip_sums <- axys_pops_adip %>%
+  pivot_longer(cols = c(2:ncol(.)), names_to = "COMPOUND", values_to = "ADJ_CONC") %>%
+  left_join(., chem_list_2, by = c("COMPOUND" = "Compound")) %>%
+  group_by(DONOR, Dioxin_similarity) %>%
+  mutate(AnalyteSums = sum(ADJ_CONC, na.rm = TRUE)) %>%
+  ungroup() %>%
+  group_by(DONOR, Dioxin_similarity, AnalyteSums) %>%
+  summarise() %>%
+  pivot_wider(names_from = Dioxin_similarity, values_from = AnalyteSums) %>%
+  mutate(PCB = rowSums(across(c("Dioxin-like", "Non-dioxin-like")))) %>%
+  dplyr::select(-OCP) %>%
+  relocate(DONOR, Dioxin, PCB) %>%
+  ungroup()
+```
+
+## Transform data
+
+```{r}
+transform_column <- function(col, method = "log2") {
+  if (method == "log2") {
+    return(log2(col + 1))  # Adding 1 to handle zero values if needed
+  } else if (method == "sqrt") {
+    return(sqrt(col))
+  } else if (method == "boxcox") {
+    # Check for negative values, as Box-Cox requires positive data
+    if (all(col > 0)) {
+      lambda <- MASS::boxcox(lm(col ~ 1), plot = FALSE)$x[which.max(MASS::boxcox(lm(col ~ 1), plot = FALSE)$y)]
+      return((col ^ lambda - 1) / lambda)
+    } else {
+      warning("Box-Cox transformation requires positive values")
+      return(col)
+    }
+  } else {
+    stop("Unknown transformation method")
+  }
+}
+```
+
+```{r}
+library(purrr)
+library(ggplot2)
+library(moments)
+
+# Define a function to check transformations for each column
+check_distribution <- function(df) {
+  
+  # Helper function to plot and run checks for a single variable
+  analyze_column <- function(col_data, col_name) {
+    # Create histogram using tidy evaluation
+    hist_plot <- ggplot(df, aes(x = !!rlang::sym(col_name))) + 
+      geom_histogram(bins = 30, fill = "lightblue", color = "black") +
+      labs(title = paste("Histogram of", col_name))
+    
+    # Create Q-Q plot using tidy evaluation
+    qq_plot <- ggplot(df, aes(sample = !!rlang::sym(col_name))) +
+      stat_qq() + stat_qq_line() +
+      labs(title = paste("Q-Q Plot of", col_name))
+    
+    # Shapiro-Wilk test for normality
+    shapiro_result <- tryCatch({
+      shapiro_test <- shapiro.test(col_data)
+      list(statistic = shapiro_test$statistic, p.value = shapiro_test$p.value)
+    }, error = function(e) {
+      list(statistic = NA, p.value = NA)  # Handle errors (e.g., for non-numeric columns)
+    })
+    
+    # Skewness and Kurtosis
+    skewness_val <- tryCatch(skewness(col_data, na.rm = TRUE), error = function(e) NA)
+    kurtosis_val <- tryCatch(kurtosis(col_data, na.rm = TRUE), error = function(e) NA)
+    
+    # Output results
+    list(
+      hist_plot = hist_plot,
+      qq_plot = qq_plot,
+      shapiro_result = shapiro_result,
+      skewness = skewness_val,
+      kurtosis = kurtosis_val
+    )
+  }
+  
+  # Select numeric columns and apply analysis with named results
+  numeric_cols <- df %>% select_if(is.numeric)
+  
+  # Use purrr::imap to retain column names in the output list
+  results <- purrr::imap(numeric_cols, ~ analyze_column(.x, .y))
+  
+  return(results)
+}
+
+# Access and display results for a specific column, e.g., PCB1
+results[["PCB1"]][["hist_plot"]]
+results[["PCB1"]][["qq_plot"]]
+results[["PCB1"]][["shapiro_result"]]
+results[["PCB1"]][["skewness"]]
+results[["PCB1"]][["kurtosis"]]
+```
+
+```{r, fig.width=20}
+library(gridExtra)
+
+# Function to display all histograms and Q-Q plots
+output_plots <- function(results) {
+  
+  # Loop through results and extract the plots
+  plots_list <- map(results, function(res) {
+    list(
+      hist_plot = res$hist_plot,
+      qq_plot = res$qq_plot
+    )
+  })
+  
+  # Flatten the list of plots for easier display
+  all_hist_plots <- map(plots_list, "hist_plot")
+  all_qq_plots <- map(plots_list, "qq_plot")
+  
+  # Display histograms
+  print("Histograms:")
+  grid.arrange(grobs = all_hist_plots, ncol = 5)  # Adjust ncol for desired layout
+  
+  # Display Q-Q plots
+  print("Q-Q Plots:")
+  grid.arrange(grobs = all_qq_plots, ncol = 5)  # Adjust ncol for desired layout
+}
+
+```
+
+```{r}
+# Combine single analyte concentrations with sums
+axys_pops_with_sums_panc <- axys_pops_panc %>%
+  left_join(., axys_panc_sums, by = c("DONOR" = "DONOR"))
+
+axys_pops_with_sums_adip <- axys_pops_adip %>%
+  left_join(., axys_adip_sums, by = c("DONOR" = "DONOR"))
+```
+
+```{r}
+# Transform data
+axys_pops_panc_log <- axys_pops_with_sums_panc %>%
+  mutate(across(where(is.numeric), ~ transform_column(., method = "log2")))
+
+axys_pops_adip_log <- axys_pops_with_sums_adip %>%
+  mutate(across(where(is.numeric), ~ transform_column(., method = "log2")))
+```
+
+```{r, fig.width=20}
+# Check plots without any transformations
+axys_pops_panc_res <- check_distribution(axys_pops_panc)
+axys_pops_adip_res <- check_distribution(axys_pops_adip)
+
+# Output plots
+output_plots(axys_pops_panc_res)
+output_plots(axys_pops_adip_res)
+
+# Check transformations after log-transforming
+axys_pops_panc_log_res <- check_distribution(axys_pops_panc_log)
+axys_pops_adip_log_res <- check_distribution(axys_pops_adip_log)
+
+# Output plots
+output_plots(axys_pops_panc_log_res)
+output_plots(axys_pops_adip_log_res)
+
+```
+
+```{r}
+# Combine single analyte concentrations and sums with metadata
+axys_pops_with_sums_panc_meta <- axys_pops_panc_log %>%
+  left_join(., axys_metadata, by = c("DONOR" = "Id")) %>%
+  dplyr::select(-Hba1c_category)
+
+axys_pops_with_sums_adip_meta <- axys_pops_adip_log %>%
+  left_join(., axys_metadata, by = c("DONOR" = "Id")) %>%
+  dplyr::select(-Hba1c_category)
+```
+
+## Load static GSIS and perifusion data
+
+```{r}
+# load GSIS data from ADI
+gsis_adi_all_ave <- read_excel("../../data/Perifusion+GSIS/2024-05-18_IsletCore_GSIS_from_TeamGrant_website.xlsx") %>%
+  dplyr::mutate_at(c(4:7), as.numeric) %>%
+  group_by(Donor, Cond) %>%
+  dplyr::mutate(Cond = factor(Cond, levels = c("1", "2", "3")),
+                InsulinContent_IsletCore = mean(InsulinContent),
+                LG_IsletCore = mean(LG, na.rm = TRUE),
+                HG_IsletCore = mean(HG, na.rm = TRUE),
+                SI_IsletCore = mean(SI, na.rm = TRUE),
+                .keep = c("unused")) %>%
+  distinct(Donor, Cond, .keep_all = TRUE) %>%
+  dplyr::select(-replicate) %>%
+  ungroup()
+  
+gsis_adi <- gsis_adi_all_ave %>%
+  pivot_wider(names_from = Cond, values_from = c(InsulinContent_IsletCore, LG_IsletCore, HG_IsletCore, SI_IsletCore)) %>%
+  relocate(Donor, InsulinContent_IsletCore_1, LG_IsletCore_1, HG_IsletCore_1, SI_IsletCore_1,
+           InsulinContent_IsletCore_2, LG_IsletCore_2, HG_IsletCore_2, SI_IsletCore_2,
+           InsulinContent_IsletCore_3, LG_IsletCore_3, HG_IsletCore_3, SI_IsletCore_3)
+```
+
+```{r}
+# Load perifusion data from Jelena Kolic
+peri_jk <- read_excel("../../data/Perifusion+GSIS/2024-04-06_Jelena_all_perifusion_AUCs.xlsx") %>%
+ dplyr::mutate(PerifusionParam = str_c("JK", PerifusionParam, sep = "_"),
+         .keep = "unused") %>% 
+  dplyr::mutate_at(c(4:148), as.numeric)
+
+# Separate data based on perifusion type (glucose, leucine, oleate-pamlitate)
+glu_peri_jk <- peri_jk %>%
+  dplyr::filter(Secretagogue == "GLU") %>%
+  remove_empty("cols")
+
+leu_peri_jk <- peri_jk %>%
+  dplyr::filter(Secretagogue == "LEU") %>%
+  remove_empty("cols")
+
+fa_peri_jk <- peri_jk %>%
+  dplyr::filter(Secretagogue == "OLE-PALM") %>%
+  remove_empty("cols")
+
+# Transpose for matrices
+glu_peri_jk_t <- glu_peri_jk %>%
+  dplyr::select(-c(MainOutcome, Secretagogue)) %>%
+  t() %>%
+  as.data.frame() %>%
+  set_names(.[1, ]) %>%
+  slice_tail(., n = (nrow(.)-1)) %>%
+  mutate(Donor = rownames(.),
+         .keep = c("unused")) %>%
+  mutate(Donor = str_remove(Donor, pattern = "Donor"),
+         across(where(is.character), str_squish)) %>%
+  relocate(Donor) %>%
+  mutate_at(c(2:20), as.numeric)
+
+leu_peri_jk_t <- leu_peri_jk %>%
+  dplyr::select(-c(MainOutcome, Secretagogue)) %>%
+  t() %>%
+  as.data.frame() %>%
+  set_names(.[1, ]) %>%
+  slice_tail(., n = (nrow(.)-1)) %>%
+  mutate(Donor = rownames(.),
+         .keep = c("unused")) %>%
+  mutate(Donor = str_remove(Donor, pattern = "Donor"),
+         across(where(is.character), str_squish)) %>%
+  relocate(Donor) %>%
+  mutate_at(c(2:12), as.numeric)
+
+fa_peri_jk_t <- fa_peri_jk %>%
+  dplyr::select(-c(MainOutcome, Secretagogue)) %>%
+  t() %>%
+  as.data.frame() %>%
+  set_names(.[1, ]) %>%
+  slice_tail(., n = (nrow(.)-1)) %>%
+  mutate(Donor = rownames(.),
+         .keep = c("unused")) %>%
+  mutate(Donor = str_remove(Donor, pattern = "Donor"),
+         across(where(is.character), str_squish)) %>%
+  relocate(Donor) %>%
+  mutate_at(c(2:12), as.numeric)
+```
+
+```{r}
+# Load Myriam perifusion data
+glu_peri_mh <- read_excel("../../data/Perifusion+GSIS/2024-01-25_Perifusion_FINAL DATA_For analysis_AC.xlsx") %>%
+  mutate(PerifusionParam = str_c("MH", PerifusionParam, sep = "_"),
+         .keep = c("unused")) %>% 
+  dplyr::mutate_at(c(3:32), as.numeric)
+
+glu_peri_mh_t <- glu_peri_mh %>%
+  dplyr::select(-MainOutcome) %>%
+  t() %>%
+  as.data.frame() %>%
+  set_names(.[1, ]) %>%
+  slice_tail(., n = (nrow(.)-1)) %>%
+  mutate(Donor = rownames(.),
+         .keep = c("unused")) %>%
+  mutate(Donor = str_remove(Donor, pattern = "Donor"),
+         across(where(is.character), str_squish)) %>%
+  relocate(Donor)
+```
+
+## Combine pollutant concentration data with other data types
+
+```{r}
+axys_adi_gsis_panc <- axys_pops_with_sums_panc_meta %>%
+  left_join(gsis_adi, by = c("DONOR" = "Donor"))
+
+axys_adi_gsis_adip <- axys_pops_with_sums_adip_meta %>%
+  left_join(gsis_adi, by = c("DONOR" = "Donor"))
+
+axys_glu_peri_jk_panc <- axys_pops_with_sums_panc_meta %>%
+  left_join(glu_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_glu_peri_jk_adip <- axys_pops_with_sums_adip_meta %>%
+  left_join(glu_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_leu_peri_jk_panc <- axys_pops_with_sums_panc_meta %>%
+  left_join(leu_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_leu_peri_jk_adip <- axys_pops_with_sums_adip_meta %>%
+  left_join(leu_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_fa_peri_jk_panc <- axys_pops_with_sums_panc_meta %>%
+  left_join(fa_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_fa_peri_jk_adip <- axys_pops_with_sums_adip_meta %>%
+  left_join(fa_peri_jk_t, by = c("DONOR" = "Donor"))
+
+axys_glu_peri_mh_panc <- axys_pops_with_sums_panc_meta %>%
+  left_join(glu_peri_mh_t, by = c("DONOR" = "Donor"))
+
+axys_glu_peri_mh_adip <- axys_pops_with_sums_adip_meta %>%
+  left_join(glu_peri_mh_t, by = c("DONOR" = "Donor"))
+
+
+axys_adi_gsis_panc <- axys_pops_with_sums_panc_meta %>%
+  left_join(gsis_adi, by = c("DONOR" = "Donor"))
+
+axys_func_dfs_panc <- list(axys_pops_with_sums_panc_meta, gsis_adi, glu_peri_jk_t, leu_peri_jk_t, fa_peri_jk_t, glu_peri_mh_t)
+
+axys_func_dfs_adip <- list(axys_pops_with_sums_adip_meta, gsis_adi, glu_peri_jk_t, leu_peri_jk_t, fa_peri_jk_t, glu_peri_mh_t)
+
+axys_func_all_panc <- reduce(axys_func_dfs_panc, left_join, by = c("DONOR" = "Donor"))
+axys_func_all_adip <- reduce(axys_func_dfs_adip, left_join, by = c("DONOR" = "Donor"))
+```
+
+```{r}
+# Create compounds list
+sum_dioxin <- data.frame(Compound = "Dioxin", Dioxin_similarity = "Dioxin")
+sum_pcb <- data.frame(Compound = c("PCB", "Dioxin-like", "Non-dioxin-like"), Dioxin_similarity = c("Dioxin-like", "Dioxin-like", "Non-dioxin-like"))
+
+dioxin_list <- chem_list_2 %>%
+  dplyr::filter(Dioxin_similarity == "Dioxin") %>%
+  bind_rows(sum_dioxin) %>%
+  dplyr::pull(Compound)
+
+pcb_list <- chem_list_2 %>%
+  dplyr::filter(Dioxin_similarity == "Dioxin-like" | Dioxin_similarity == "Non-dioxin-like") %>%
+  bind_rows(sum_pcb) %>%
+  dplyr::pull(Compound)
+
+ocp_list <- chem_list_2 %>%
+  dplyr::filter(Dioxin_similarity == "OCP") %>%
+  dplyr::pull(Compound)
+```
+
+```{r}
+# Functional parameters
+gsis_adi_param <- colnames(gsis_adi)[2:ncol(gsis_adi)]
+glu_peri_jk_param <- colnames(glu_peri_jk_t)[2:ncol(glu_peri_jk_t)]
+leu_peri_jk_param <- colnames(leu_peri_jk_t)[2:ncol(leu_peri_jk_t)]
+fa_peri_jk_param <- colnames(fa_peri_jk_t)[2:ncol(fa_peri_jk_t)]
+glu_peri_mh_param <- colnames(glu_peri_mh_t)[2:ncol(glu_peri_mh_t)]
+```
+
+
+```{r}
+library(purrr)
+
+# Define your pollutants and functional outputs
+# pollutants <- chem_list_2 %>%
+#   bind_rows(sum_dioxin, sum_pcb) %>%
+#   dplyr::pull(Compound)
+
+pollutants <- chem_list_2 %>%
+  bind_rows(sum_pcb, sum_dioxin) %>%
+  dplyr::pull(Compound)
+
+functional_outputs <- c(gsis_adi_param, glu_peri_jk_param, leu_peri_jk_param, fa_peri_jk_param, glu_peri_mh_param)
+
+```
+
+```{r}
+# Helper function to safely wrap variable names with backticks if needed
+safe_var <- function(var_name) {
+  if (grepl("[^[:alnum:]_]", var_name)) {
+    return(paste0("`", var_name, "`"))
+  } else {
+    return(var_name)
+  }
+}
+
+# List of covariates (including an option for no covariates)
+covariate_combinations <- list(
+  "None" = character(0),  # No covariates
+  "BMI" = c("BMI"),
+  "Age" = c("Age"),
+  "Sex" = c("Sex"),
+  "Age_BMI" = c("Age", "BMI")
+)
+
+# Define a function that fits models
+fit_model <- function(df, func, pollutant, covariates) {
+  # Make variable names safe for formula
+  func_safe <- safe_var(func)
+  pollutant_safe <- safe_var(pollutant)
+  
+  # Construct the formula, accounting for the case of no covariates
+  if (length(covariates) == 0) {
+    formula <- as.formula(paste0(func_safe, " ~ ", pollutant_safe))
+  } else {
+    formula <- as.formula(paste0(func_safe, " ~ ", pollutant_safe, " + ", paste(covariates, collapse = " + ")))
+  }
+
+  # Fit the model only if columns exist in the dataframe
+  if (all(c(func, pollutant) %in% colnames(df))) {
+    lm(formula, data = df)
+  } else {
+    warning(paste("Column", func, "or", pollutant, "not found in dataframe."))
+    return(NULL)
+  }
+}
+
+# Fit models
+fit_all_models <- function(df) {
+  # Filter pollutants and functional outputs to only those present in df
+  available_pollutants <- pollutants[pollutants %in% colnames(df)]
+  available_outputs <- functional_outputs[functional_outputs %in% colnames(df)]
+  
+  # Create combinations using only available pollutants and functional outputs
+  combinations <- expand_grid(available_outputs, available_pollutants)
+  
+  # Fit all models
+  models <- combinations %>%
+    pmap(~ {
+      func <- ..1
+      pollutant <- ..2
+      
+      # Fit models for each covariate combination
+      map(covariate_combinations, ~ fit_model(df, func, pollutant, .x))
+    })
+  
+  # Name the models for easier access
+  model_names <- combinations %>%
+    mutate(name = paste(available_outputs, available_pollutants, sep = "__")) %>%
+    pull(name)
+  
+  names(models) <- model_names
+  
+  return(models)
+}
+
+# Updated fit_all_models function with comparison metrics
+fit_models_metrics <- function(df) {
+  # Filter pollutants and functional outputs to only those present in df
+  available_pollutants <- pollutants[pollutants %in% colnames(df)]
+  available_outputs <- functional_outputs[functional_outputs %in% colnames(df)]
+  
+  # Define a list of covariate combinations, including "no covariates" option
+  full_covariate_combinations <- c(list("None" = NULL), covariate_combinations)
+  
+  # Create combinations using only available pollutants and functional outputs
+  combinations <- expand_grid(func = available_outputs, pollutant = available_pollutants)
+  
+  # Fit models and calculate comparison metrics
+  model_metrics <- combinations %>%
+    pmap_df(~ {
+      func <- ..1
+      pollutant <- ..2
+      
+      # Fit models with each covariate combination and store metrics
+      metrics <- map_dfr(names(full_covariate_combinations), function(covar_name) {
+        covars <- full_covariate_combinations[[covar_name]]  # Get covariates
+        
+        model <- fit_model(df, func, pollutant, covars)
+        
+        if (!is.null(model)) {
+          tibble(
+            functional_output = func,
+            pollutant = pollutant,
+            covariates = covar_name,
+            AIC = AIC(model),
+            adj_r_squared = summary(model)$adj.r.squared
+          )
+        } else {
+          # Return NA for cases where the model couldn't be fit
+          tibble(
+            functional_output = func,
+            pollutant = pollutant,
+            covariates = covar_name,
+            AIC = NA,
+            adj_r_squared = NA
+          )
+        }
+      })
+      
+      metrics
+    })
+  
+  return(model_metrics)
+}
+# Accessing a specific model (e.g., high_glucose and PCB1 with BMI as covariate)
+#summary(models[["high_glucose_PCB1"]][["BMI"]])
+```
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(purrr)
+
+summarize_models <- function(models) {
+  # Initialize an empty list to collect all summaries
+  model_summaries <- imap_dfr(models, ~ {
+    # Split .y into functional_output and pollutant before proceeding
+    components <- strsplit(.y, "__")[[1]]
+    functional_output <- components[1]  # First part
+    pollutant <- paste(components[-1], collapse = "__")  # Everything after the first part, combined back
+    
+    map_dfr(.x, function(model, covar_name) {
+      # Attempt to extract summary statistics
+      summary_result <- tryCatch({
+        if (!is.null(model)) {
+          summary_model <- summary(model)
+          
+          # Check if the coefficients are available
+          if (!is.null(summary_model$coefficients) && is.matrix(summary_model$coefficients)) {
+            tibble(
+              term = rownames(summary_model$coefficients),
+              estimate = summary_model$coefficients[, "Estimate"],
+              std_error = summary_model$coefficients[, "Std. Error"],
+              p_value = summary_model$coefficients[, "Pr(>|t|)"],
+              r_squared = summary_model$r.squared,
+              adj_r_squared = summary_model$adj.r.squared,
+              AIC = AIC(model),
+              residual_std_error = summary_model$sigma,  # Residual standard error
+              f_statistic = summary_model$fstatistic[1], # F-statistic
+              model_p_value = pf(summary_model$fstatistic[1], 
+                                 summary_model$fstatistic[2], 
+                                 summary_model$fstatistic[3], 
+                                 lower.tail = FALSE) # p-value of F-statistic
+            )
+          } else {
+            # If no coefficients, return NA row
+            tibble(term = NA, estimate = NA, std_error = NA, p_value = NA, 
+                   r_squared = NA, adj_r_squared = NA, AIC = AIC(model),
+                   residual_std_error = NA, f_statistic = NA, model_p_value = NA)
+          }
+        } else {
+          # Return empty row for missing model
+          tibble(term = NA, estimate = NA, std_error = NA, p_value = NA, 
+                 r_squared = NA, adj_r_squared = NA, AIC = NA,
+                 residual_std_error = NA, f_statistic = NA, model_p_value = NA)
+        }
+      }, error = function(e) {
+        # Handle any errors during summary extraction
+        tibble(term = NA, estimate = NA, std_error = NA, p_value = NA, 
+               r_squared = NA, adj_r_squared = NA, AIC = NA,
+               residual_std_error = NA, f_statistic = NA, model_p_value = NA)
+      })
+
+      return(summary_result)
+    }, .id = "covariate") %>%
+    mutate(functional_output = functional_output, pollutant = pollutant)  # Add separate columns for functional output and pollutant
+  })
+
+  return(model_summaries)
+}
+```
+
+```{r}
+# Run models
+axys_func_mod_panc <- fit_all_models(axys_func_all_panc)
+axys_func_mod_adip <- fit_all_models(axys_func_all_adip)
+
+# Get metrics
+axys_func_metrics_panc <- fit_models_metrics(axys_func_all_panc)
+axys_func_metrics_adip <- fit_models_metrics(axys_func_all_adip)
+
+# Get model summaries
+axys_func_mod_panc_sum <- summarize_models(axys_func_mod_panc)
+axys_func_mod_adip_sum <- summarize_models(axys_func_mod_adip)
+
+write_csv(axys_func_mod_panc_sum, "2024-12-10_axys_func_log_mod_panc_summary.csv")
+write_csv(axys_func_mod_adip_sum, "2024-12-10_axys_func_log_mod_adip_summary.csv")
+
+# Filter for comparisons of specific functional output-pollutant pairs, if desired
+# Example: Compare models for "high_glucose" output with "PCB1" pollutant
+model_comparison <- model_metrics %>%
+  filter(functional_outputs == "high_glucose", pollutants == "PCB1") %>%
+  select(covariates, AIC, adj_r_squared)
+```
+
+```{r}
+# Filter desired comparisons
+model_comparisons_panc <- axys_main_corr %>%
+  dplyr::filter(Tissue == "Pancreas", !Comparison %in% c("Age", "BMI", "Hba1c")) %>%
+  left_join(axys_func_mod_panc_sum, by = c("Pollutant" = "pollutant", "Comparison" = "functional_output"))
+
+model_comparisons_adip <- axys_main_corr %>%
+  dplyr::filter(Tissue == "Adipose", !Comparison %in% c("Age", "BMI", "Hba1c")) %>%
+  left_join(axys_func_mod_adip_sum, by = c("Pollutant" = "pollutant", "Comparison" = "functional_output"))
+
+# write_csv(model_comparisons_panc, "2024-10-11_axys_func_log_mod_panc_filtered.csv")
+# write_csv(model_comparisons_adip, "2024-10-11_axys_func_log_mod_adip_filtered.csv")
+
+```
+

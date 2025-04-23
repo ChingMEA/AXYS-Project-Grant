@@ -1,0 +1,652 @@
+---
+title: "AXYS correlations: PCA analyses"
+author: "Angela Ching"
+date: "`r Sys.Date()`"
+output: 
+  html_notebook:
+    toc: yes
+---
+
+# Packages
+
+```{r}
+library(tidyverse)
+library(readxl)
+library(ggplot2)
+
+# For PCA analysis
+library(stats)
+library(ggfortify)
+library(ggrepel)
+library(factoextra)
+library(pcaMethods)
+```
+
+# Load AXYS data
+
+```{r AXYS_data}
+# load chemical list
+chem_list <- read_csv("../../data/2022-10-18_AXYS_chemicals_list_AC.csv") %>%
+  dplyr::select(Compound, Dioxin_subtype)
+
+# load AXYS data
+axys_pops <- read_csv("../../outputs/2024-08-24_ProjectGrant_excluded_outliers_for_single_analyte_analyses.csv") %>%
+  dplyr::select(-c(CONC_BLANK_adj, IS_BLANK_ADJ_CONC_HIGHER_THAN_LOD)) %>%
+  mutate(BLANK_and_LOD_adj = as.numeric(BLANK_and_LOD_adj),
+         File = factor(File),
+         COMPOUND = case_when(str_detect(COMPOUND, "TOTAL") ~ str_to_sentence(COMPOUND),
+                              str_detect(COMPOUND, " Epoxide") ~ str_to_sentence(COMPOUND),
+                              TRUE ~ COMPOUND),
+         across(where(is.character), str_squish))
+
+axys_pops_2 <- axys_pops %>%
+  dplyr::select(-c(File, LAB_FLAG, DETECTION_LIMIT)) %>%
+  mutate(across(where(is.character), str_squish))
+
+# load AXYS data with imputed values for true NAs (chemicals not measured by AXYS in certain donors)
+axys_pops_imputed_panc <- read_excel("../../outputs/2024-09-03_axys_pops_includes_imputed_values_for_true_NAs_using_mice_package.xlsx", sheet = 1)
+axys_pops_imputed_adip <- read_excel("../../outputs/2024-09-03_axys_pops_includes_imputed_values_for_true_NAs_using_mice_package.xlsx", sheet = 2)
+
+# load AXYS sum data
+axys_sums <- read_csv("../../outputs/2024-08-24_ProjectGrant_sums_per_donor_AC.csv")
+
+# load AXYS donor metadata
+axys_metadata <- read_csv("../../data/2024-08-22_donor_characteristics_FINAL.csv", show_col_types = FALSE) %>%
+  mutate(BMI_category = case_when(BMI < 24.9 ~ "Lean",
+                                  BMI >= 24.9 & BMI <= 29.9 ~ "Overweight",
+                                  BMI > 29.9 ~ "Obese"),
+         Hba1c_category = case_when(Hba1c < 6 ~ "Normoglycemic",
+                                    Hba1c <= 6.5 ~ "Prediabetic",
+                                    Hba1c > 6.5 ~ "Diabetic"),
+         BMI_category = factor(BMI_category, levels = c("Lean", "Overweight", "Obese")),
+         Hba1c_category = factor(Hba1c_category, levels = c("Normoglycemic", "Prediabetic", "Diabetic")),
+         Sex = as_factor(Sex),
+         Diabetes_status = as_factor(Diabetes_status)) %>%
+  dplyr::select(-Purity)
+
+# Donor IDs
+axys_donors <- axys_metadata %>%
+  dplyr::select(Id)
+```
+
+```{r}
+subset_tissue <- function(tissue) {
+  axys_pops_2 %>%
+    dplyr::filter(!str_detect(COMPOUND, "Total"), TISSUE_TYPE == tissue) %>%
+    dplyr::select(DONOR, COMPOUND, BLANK_and_LOD_adj) %>%
+    group_by(DONOR) %>%
+    pivot_wider(names_from = COMPOUND, values_from = BLANK_and_LOD_adj) %>%
+    ungroup()
+}
+
+axys_pops_panc <- subset_tissue("Pancreas")
+axys_pops_adip <- subset_tissue("Adipose")
+```
+
+```{r}
+# Combine axys data with metadata
+axys_pops_meta_panc <- axys_pops_panc %>%
+  left_join(., axys_metadata, by = c("DONOR" = "Id")) %>%
+  dplyr::select(-Hba1c_category)
+
+axys_pops_meta_adip <- axys_pops_adip %>%
+  left_join(., axys_metadata, by = c("DONOR" = "Id")) %>%
+  dplyr::select(-Hba1c_category)
+
+axys_pops_meta_panc_imputed <- axys_pops_imputed_panc %>%
+  left_join(., axys_metadata, by = c("DONOR" = "Id")) %>%
+  dplyr::select(-Hba1c_category)
+
+axys_pops_meta_adip_imputed <- axys_pops_imputed_adip %>%
+  left_join(., axys_metadata, by = c("DONOR" = "Id")) %>%
+  dplyr::select(-Hba1c_category)
+```
+
+```{r}
+# Remove outlier donors
+rm_ind_adip <- c("R419", "R421")
+rm_ind_panc <- c("R389", "R419", "R448")
+
+# pancreas
+axys_pops_meta_panc_rm_ind <- axys_pops_meta_panc %>%
+  dplyr::filter(!(DONOR %in% rm_ind_panc))
+
+axys_pops_meta_panc_rm_389 <- axys_pops_meta_panc %>%
+  dplyr::filter(DONOR != "R389")
+
+axys_pops_meta_panc_rm_419 <- axys_pops_meta_panc %>%
+  dplyr::filter(DONOR != "R419")
+
+axys_pops_meta_panc_rm_448 <- axys_pops_meta_panc %>%
+  dplyr::filter(DONOR != "R448")
+
+# Adipose
+axys_pops_meta_adip_rm_ind <- axys_pops_meta_adip %>%
+  dplyr::filter(!(DONOR %in% rm_ind_adip))
+
+axys_pops_meta_adip_rm_419 <- axys_pops_meta_adip %>%
+  dplyr::filter(DONOR != "R419")
+
+axys_pops_meta_adip_rm_421 <- axys_pops_meta_adip %>%
+  dplyr::filter(DONOR != "R421")
+```
+
+# PCA analyses
+
+```{r}
+# Standardize data for PCA - with all donors and with outliers removed ("_rm_ind")
+axys_pops_meta_panc_std <- scale(axys_pops_meta_panc[, c(2:34, 36:38)])
+axys_pops_meta_adip_std <- scale(axys_pops_meta_adip[, c(2:42, 44:46)])
+
+axys_pops_meta_panc_std_rm_ind <- scale(axys_pops_meta_panc_rm_ind[, c(2:34, 36:38)])
+axys_pops_meta_panc_std_rm_389 <- scale(axys_pops_meta_panc_rm_389[, c(2:34, 36:38)])
+axys_pops_meta_panc_std_rm_419 <- scale(axys_pops_meta_panc_rm_419[, c(2:34, 36:38)])
+axys_pops_meta_panc_std_rm_448 <- scale(axys_pops_meta_panc_rm_448[, c(2:34, 36:38)])
+
+axys_pops_meta_adip_std_rm_ind <- scale(axys_pops_meta_adip_rm_ind[, c(2:42, 44:46)])
+axys_pops_meta_adip_std_rm_419 <- scale(axys_pops_meta_adip_rm_419[, c(2:42, 44:46)])
+axys_pops_meta_adip_std_rm_421 <- scale(axys_pops_meta_adip_rm_421[, c(2:42, 44:46)])
+
+# Standardize data for PCA - with imputed datasets
+axys_pops_meta_panc_imp_std <- scale(axys_pops_meta_panc_imputed[, c(2:34, 36:37)])
+axys_pops_meta_adip_imp_std <- scale(axys_pops_meta_adip_imputed[, c(2:42, 44:45)])
+
+# Run PCA with all donors and with outliers removed ("_rm_ind")
+pca_result_panc <- prcomp(axys_pops_meta_panc_std, center = TRUE, scale = TRUE)
+pca_result_panc_rm_ind <- prcomp(axys_pops_meta_panc_std_rm_ind, center = TRUE, scale = TRUE)
+pca_result_panc_rm_389 <- prcomp(axys_pops_meta_panc_std_rm_389, center = TRUE, scale = TRUE)
+pca_result_panc_rm_419 <- prcomp(axys_pops_meta_panc_std_rm_419, center = TRUE, scale = TRUE)
+pca_result_panc_rm_448 <- prcomp(axys_pops_meta_panc_std_rm_448, center = TRUE, scale = TRUE)
+
+pca_result_adip <- prcomp(axys_pops_meta_adip_std, center = TRUE, scale = TRUE)
+pca_result_adip_rm_ind <- prcomp(axys_pops_meta_adip_std_rm_ind, center = TRUE, scale = TRUE)
+pca_result_adip_rm_419 <- prcomp(axys_pops_meta_adip_std_rm_419, center = TRUE, scale = TRUE)
+pca_result_adip_rm_421 <- prcomp(axys_pops_meta_adip_std_rm_421, center = TRUE, scale = TRUE)
+
+# Run PCA with imputed datasets
+pca_result_panc_imp <- prcomp(axys_pops_meta_panc_imp_std, center = TRUE, scale = TRUE)
+pca_result_adip_imp <- prcomp(axys_pops_meta_adip_imp_std, center = TRUE, scale = TRUE)
+
+pca_result_panc %>%
+  autoplot(., data = axys_pca_panc, colour = "Sex", size = 3) +
+  theme_minimal() +
+  ggtitle("PCA of pollutant concentrations in pancreas") +
+  geom_text_repel(vjust = -1, label = axys_pca_panc$DONOR, max.overlaps = 20, size = 3) +
+  theme(axis.title.x = element_text(size=14),
+        axis.title.y = element_text(size=14),
+        axis.text.x = element_text(size=10, angle=0),
+        axis.text.y = element_text(size=10, angle=0),
+        plot.title = element_text(size=14),
+        legend.position = "right")
+
+pca_result_panc_rm_ind %>%
+  autoplot(., data = axys_pca_panc_rm_ind, colour = "Sex", size = 3) +
+  theme_minimal() +
+  ggtitle("PCA of pollutant concentrations in pancreas (removed 3 outlier donors)") +
+  geom_text_repel(vjust = -1, label = axys_pca_panc_rm_ind$DONOR, max.overlaps = 20, size = 3) +
+  theme(axis.title.x = element_text(size=14),
+        axis.title.y = element_text(size=14),
+        axis.text.x = element_text(size=10, angle=0),
+        axis.text.y = element_text(size=10, angle=0),
+        plot.title = element_text(size=14),
+        legend.position = "right")
+
+pca_result_panc_rm_389 %>%
+  autoplot(., data = axys_pca_panc_rm_389, colour = "Sex", size = 3) +
+  theme_minimal() +
+  ggtitle("PCA of pollutant concentrations in pancreas (removed R389)") +
+  geom_text_repel(vjust = -1, label = axys_pca_panc_rm_389$DONOR, max.overlaps = 20, size = 3) +
+  theme(axis.title.x = element_text(size=14),
+        axis.title.y = element_text(size=14),
+        axis.text.x = element_text(size=10, angle=0),
+        axis.text.y = element_text(size=10, angle=0),
+        plot.title = element_text(size=14),
+        legend.position = "right")
+
+pca_result_panc_rm_419 %>%
+  autoplot(., data = axys_pca_panc_rm_419, colour = "Sex", size = 3) +
+  theme_minimal() +
+  ggtitle("PCA of pollutant concentrations in pancreas (removed R419)") +
+  geom_text_repel(vjust = -1, label = axys_pca_panc_rm_419$DONOR, max.overlaps = 20, size = 3) +
+  theme(axis.title.x = element_text(size=14),
+        axis.title.y = element_text(size=14),
+        axis.text.x = element_text(size=10, angle=0),
+        axis.text.y = element_text(size=10, angle=0),
+        plot.title = element_text(size=14),
+        legend.position = "right")
+
+pca_result_panc_rm_448 %>%
+  autoplot(., data = axys_pca_panc_rm_448, colour = "Sex", size = 3) +
+  theme_minimal() +
+  ggtitle("PCA of pollutant concentrations in pancreas (removed R448)") +
+  geom_text_repel(vjust = -1, label = axys_pca_panc_rm_448$DONOR, max.overlaps = 20, size = 3) +
+  theme(axis.title.x = element_text(size=14),
+        axis.title.y = element_text(size=14),
+        axis.text.x = element_text(size=10, angle=0),
+        axis.text.y = element_text(size=10, angle=0),
+        plot.title = element_text(size=14),
+        legend.position = "right")
+
+pca_result_adip %>%
+  autoplot(., data = axys_pca_adip, colour = "Sex", size = 3) +
+  theme_minimal() +
+  ggtitle("PCA of pollutant concentrations in adipose") +
+  geom_text_repel(vjust = -1, label = axys_pca_adip$DONOR, max.overlaps = 20, size = 3) +
+  theme(axis.title.x = element_text(size=14),
+        axis.title.y = element_text(size=14),
+        axis.text.x = element_text(size=10, angle=0),
+        axis.text.y = element_text(size=10, angle=0),
+        plot.title = element_text(size=14),
+        legend.position = "right")
+
+pca_result_adip_rm_ind %>%
+  autoplot(., data = axys_pca_adip_rm_ind, colour = "Sex", size = 3) +
+  theme_minimal() +
+  ggtitle("PCA of pollutant concentrations in adipose (removed 2 outlier donors)") +
+  geom_text_repel(vjust = -1, label = axys_pca_adip_rm_ind$DONOR, max.overlaps = 20, size = 3) +
+  theme(axis.title.x = element_text(size=14),
+        axis.title.y = element_text(size=14),
+        axis.text.x = element_text(size=10, angle=0),
+        axis.text.y = element_text(size=10, angle=0),
+        plot.title = element_text(size=14),
+        legend.position = "right")
+
+pca_result_adip_rm_419 %>%
+  autoplot(., data = axys_pca_adip_rm_419, colour = "Sex", size = 3) +
+  theme_minimal() +
+  ggtitle("PCA of pollutant concentrations in adipose (removed R419)") +
+  geom_text_repel(vjust = -1, label = axys_pca_adip_rm_419$DONOR, max.overlaps = 20, size = 3) +
+  theme(axis.title.x = element_text(size=14),
+        axis.title.y = element_text(size=14),
+        axis.text.x = element_text(size=10, angle=0),
+        axis.text.y = element_text(size=10, angle=0),
+        plot.title = element_text(size=14),
+        legend.position = "right")
+
+pca_result_adip_rm_421 %>%
+  autoplot(., data = axys_pca_adip_rm_421, colour = "Sex", size = 3) +
+  theme_minimal() +
+  ggtitle("PCA of pollutant concentrations in adipose (removed R421)") +
+  geom_text_repel(vjust = -1, label = axys_pca_adip_rm_421$DONOR, max.overlaps = 20, size = 3) +
+  theme(axis.title.x = element_text(size=14),
+        axis.title.y = element_text(size=14),
+        axis.text.x = element_text(size=10, angle=0),
+        axis.text.y = element_text(size=10, angle=0),
+        plot.title = element_text(size=14),
+        legend.position = "right")
+
+pca_result_panc_imp %>%
+  autoplot(., data = axys_pops_meta_panc_imputed, colour = "Sex", size = 3) +
+  theme_minimal() +
+  ggtitle("PCA of pollutant concentrations in pancreas (with imputations)") +
+  geom_text_repel(vjust = -1, label = axys_pops_meta_panc_imputed$DONOR, max.overlaps = 20, size = 3) +
+  theme(axis.title.x = element_text(size=14),
+        axis.title.y = element_text(size=14),
+        axis.text.x = element_text(size=10, angle=0),
+        axis.text.y = element_text(size=10, angle=0),
+        plot.title = element_text(size=14),
+        legend.position = "right")
+
+pca_result_adip_imp %>%
+  autoplot(., data = axys_pops_meta_adip_imputed, colour = "Sex", size = 3) +
+  theme_minimal() +
+  ggtitle("PCA of pollutant concentrations in adipose (with imputations)") +
+  geom_text_repel(vjust = -1, label = axys_pops_meta_adip_imputed$DONOR, max.overlaps = 20, size = 3) +
+  theme(axis.title.x = element_text(size=14),
+        axis.title.y = element_text(size=14),
+        axis.text.x = element_text(size=10, angle=0),
+        axis.text.y = element_text(size=10, angle=0),
+        plot.title = element_text(size=14),
+        legend.position = "right")
+```
+
+```{r}
+# Function to generate PCA visualizations
+pca_visualization <- function(pca_result) {
+  # Scree plot
+  scree_plot <- fviz_eig(pca_result, addlabels = TRUE, ylim = c(0, 50)) +
+    ggtitle('Scree Plot') +
+    theme_minimal()
+  
+  # Default variable plot
+  var_plot <- fviz_pca_var(pca_result, col.var = "black")
+  
+  # Variable colors by contributions
+  contrib_plot <- fviz_pca_var(pca_result, col.var="contrib",
+                               gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"),
+                               repel = TRUE)
+  
+  # Contributions of variables to PC1
+  contrib_PC1_var <- fviz_contrib(pca_result, choice = "var", axes = 1, top = 31)
+  contrib_PC1_ind <- fviz_contrib(pca_result, choice = "ind", axes = 1, top = 31)
+  
+  # Contributions of variables to PC2
+  contrib_PC2_var <- fviz_contrib(pca_result, choice = "var", axes = 2, top = 31)
+  contrib_PC2_ind <- fviz_contrib(pca_result, choice = "ind", axes = 2, top = 31)
+  
+  # Return a list of plots
+  return(list(
+    scree_plot = scree_plot,
+    var_plot = var_plot,
+    contrib_plot = contrib_plot,
+    contrib_PC1_var = contrib_PC1_var,
+    contrib_PC1_ind = contrib_PC1_ind,
+    contrib_PC2_var = contrib_PC2_var,
+    contrib_PC2_ind = contrib_PC2_ind
+  ))
+}
+
+# Function to apply PCA and generate visualizations for a list of dataframes
+apply_pca_visualization <- function(pca_list) {
+  visualization_results <- lapply(pca_list, pca_visualization)
+  return(visualization_results)
+}
+
+```
+
+```{r}
+scree_list <- list(pca_result_panc = pca_result_panc, 
+                   pca_result_panc_rm_ind = pca_result_panc_rm_ind,
+                   pca_result_panc_rm_389 = pca_result_panc_rm_389, 
+                   pca_result_panc_rm_419 = pca_result_panc_rm_419, 
+                   pca_result_panc_rm_448 = pca_result_panc_rm_448,
+                   pca_result_adip = pca_result_adip,
+                   pca_result_adip_rm_ind = pca_result_adip_rm_ind,
+                   pca_result_adip_rm_419 = pca_result_adip_rm_419,
+                   pca_result_adip_rm_421 = pca_result_adip_rm_421)
+
+apply_pca_visualization(scree_list)
+```
+
+```{r}
+# Create a scree plot using factoextra
+fviz_eig(pca_result_panc, addlabels = TRUE, ylim = c(0, 50)) +
+  ggtitle('Scree Plot') +
+  theme_minimal()
+
+# Graph of variables: default plot
+fviz_pca_var(pca_result_panc, col.var = "black")
+
+# Control variable colors using their contributions
+fviz_pca_var(pca_result_panc, col.var="contrib",
+             gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"),
+             repel = TRUE # Avoid text overlapping
+             )
+
+# Contributions of variables to PC1
+fviz_contrib(pca_result_panc, choice = "var", axes = 1, top = 31)
+fviz_contrib(pca_result_panc, choice = "ind", axes = 1, top = 31)
+# Contributions of variables to PC2
+fviz_contrib(pca_result_panc, choice = "var", axes = 2, top = 31)
+fviz_contrib(pca_result_panc, choice = "ind", axes = 2, top = 31)
+```
+
+
+```{r}
+# Extract loadings
+loadings_panc <- as.data.frame(pca_result_panc$rotation)
+
+# Visualize loadings for PC1 and PC2
+loadings_panc$Pollutant <- rownames(loadings_panc)
+
+# Calculate absolute values of PC1 loadings
+loadings_panc$abs_PC1 <- abs(loadings_panc$PC1)
+
+# Order the data frame based on absolute PC1 loadings
+loadings_panc <- loadings_panc[order(-loadings_panc$abs_PC1), ]
+
+# Reshape for ggplot
+loadings_melt_panc <- reshape2::melt(loadings_panc, id.vars = c('Pollutant', 'abs_PC1'))
+
+# Filter for PC1 and PC2
+loadings_melt_panc_filtered <- subset(loadings_melt_panc, variable %in% c("PC1", "PC2"))
+
+# Plot
+ggplot(loadings_melt_panc_filtered, aes(x = reorder(Pollutant, abs_PC1), y = value, fill = variable)) +
+  geom_bar(stat = 'identity', position = 'dodge') +
+  labs(title = 'Loadings of Pancreas Pollutants on PC1 and PC2', 
+       x = 'Pollutant', 
+       y = 'Loading Value') +
+  theme_minimal() +
+  coord_flip()
+
+ggplot(loadings_melt_panc_filtered, aes(x = Pollutant, y = value, fill = variable)) +
+  geom_bar(stat = 'identity', position = 'dodge') +
+  labs(title = 'Loadings of Pancreas Pollutants on PC1 and PC2', 
+       x = 'Pollutant', 
+       y = 'Loading Value') +
+  theme_minimal() +
+  coord_flip()
+
+# Enhanced biplot visualization
+autoplot(pca_result_panc, data = axys_pca_panc, colour = "Sex", 
+         loadings = TRUE, loadings.colour = 'black', loadings.label = TRUE) +
+  #scale_colour_manual(values = c('non-diabetic' = 'blue', 'diabetic' = 'red')) +
+  ggtitle('PCA of Pollutant Concentrations with Loadings') +
+  theme_minimal()
+
+```
+
+
+```{r}
+# Function to visualize PCA loadings and create a biplot using the list element names as titles
+pca_loadings_visualization <- function(pca_result, name_in_list, data = NULL) {
+  # Extract loadings
+  loadings <- as.data.frame(pca_result$rotation)
+  
+  # Add pollutant names
+  loadings$Pollutant <- rownames(loadings)
+  
+  # Calculate absolute values of PC1 loadings
+  loadings$abs_PC1 <- abs(loadings$PC1)
+  
+  # Order the data frame based on absolute PC1 loadings
+  loadings <- loadings[order(-loadings$abs_PC1), ]
+  
+  # Reshape for ggplot
+  loadings_melt <- melt(loadings, id.vars = c('Pollutant', 'abs_PC1'))
+  
+  # Filter for PC1 and PC2
+  loadings_melt_filtered <- subset(loadings_melt, variable %in% c("PC1", "PC2"))
+  
+  # Plot loadings for PC1 and PC2 with the list name as the title
+  loadings_plot <- ggplot(loadings_melt_filtered, aes(x = reorder(Pollutant, abs_PC1), y = value, fill = variable)) +
+    geom_bar(stat = 'identity', position = 'dodge') +
+    labs(title = paste('Loadings of Pollutants on PC1 and PC2 -', name_in_list), 
+         x = 'Pollutant', 
+         y = 'Loading Value') +
+    theme_minimal() +
+    coord_flip()
+  
+  # Enhanced biplot visualization (if additional data provided)
+  if (!is.null(data)) {
+    biplot <- autoplot(pca_result, data = data, colour = "Sex", 
+                       loadings = TRUE, loadings.colour = 'black', loadings.label = TRUE) +
+      ggtitle(paste('PCA of Pollutant Concentrations with Loadings -', name_in_list)) +
+      theme_minimal()
+  } else {
+    biplot <- autoplot(pca_result, loadings = TRUE, loadings.colour = 'black', loadings.label = TRUE) +
+      ggtitle(paste('PCA of Pollutant Concentrations with Loadings -', name_in_list)) +
+      theme_minimal()
+  }
+  
+  # Return the plots
+  return(list(loadings_plot = loadings_plot, biplot = biplot))
+}
+
+# Function to apply the loadings visualization to a list of PCA results with named list output
+apply_pca_loadings_visualization <- function(pca_list, data_list = NULL) {
+  # Get the names of the list elements
+  df_names <- names(pca_list)
+  
+  if (is.null(data_list)) {
+    visualization_results <- mapply(pca_loadings_visualization, pca_list, name_in_list = df_names, SIMPLIFY = FALSE)
+  } else {
+    visualization_results <- mapply(pca_loadings_visualization, pca_list, name_in_list = df_names, MoreArgs = list(data = data_list), SIMPLIFY = FALSE)
+  }
+  
+  # Assign names to the list elements
+  names(visualization_results) <- df_names
+  
+  return(visualization_results)
+}
+```
+
+```{r, fig.width = 8, fig.height = 6}
+apply_pca_loadings_visualization(scree_list)
+```
+
+# UPDATE [Jan 28, 2025] : Using PCA package that can handle missing values
+
+```{r}
+# Using pcaMethods to perform PCA while having NA values
+
+# Perform PCA using the NIPALS algorithm
+pops_panc_pca <- pca(axys_pops_meta_panc, method = "nipals", nPcs = 3, scale = "uv", center = TRUE)
+
+pops_adip_pca <- pca(axys_pops_meta_adip, method = "nipals", nPcs = 3, scale = "uv", center = TRUE)
+
+# View the summary of the PCA results
+summary(pops_panc_pca)
+summary(pops_adip_pca)
+
+# Extract the scores (principal components)
+pops_panc_pca_scores <- scores(pops_panc_pca)
+pops_adip_pca_scores <- scores(pops_adip_pca)
+
+# Extract the loadings
+pops_panc_pca_loadings <- loadings(pops_panc_pca)
+pops_adip_pca_loadings <- loadings(pops_adip_pca)
+
+# Extract the R^2 values for the variance explained
+explained_variance_panc <- pops_panc_pca@R2
+explained_variance_adip <- pops_adip_pca@R2
+
+# Cumulative R^2
+cumulative_variance_panc <- cumsum(explained_variance_panc)
+cumulative_variance_adip <- cumsum(explained_variance_adip)
+
+# Extracting variance explained for PC1 and PC2
+pc1_variance_panc <- round(explained_variance_panc[1] * 100, 2)
+pc2_variance_panc <- round(explained_variance_panc[2] * 100, 2)
+
+pc1_variance_adip <- round(explained_variance_adip[1] * 100, 2)
+pc2_variance_adip <- round(explained_variance_adip[2] * 100, 2)
+
+# Plot the PCA results (scores)
+plot(pops_panc_pca_scores[, 1], pops_panc_pca_scores[, 2],
+     xlab = "PC1",
+     ylab = "PC2",
+     main = "PCA Score Plot (NIPALS)",
+     pch = 19, col = "grey50")
+
+text(pops_panc_pca_scores[, 1], pops_panc_pca_scores[, 2], labels = axys_pops_meta_panc$DONOR, pos = 3, cex = 0.8, col = "black")
+
+plot(pops_adip_pca_scores[, 1], pops_adip_pca_scores[, 2],
+     xlab = "PC1",
+     ylab = "PC2",
+     main = "PCA Score Plot (NIPALS)",
+     pch = 19, col = "grey20")
+
+text(pops_adip_pca_scores[, 1], pops_adip_pca_scores[, 2], labels = axys_pops_meta_adip$DONOR, pos = 3, cex = 0.8, col = "black")
+
+# Add a biplot for visualization (optional)
+biplot(pops_panc_pca, cex = 0.7)
+biplot(pops_adip_pca, cex = 0.7)
+
+# Plot PCA
+pops_panc_pca_data <- data.frame(PC1 = pops_panc_pca_scores[, 1],
+                       PC2 = pops_panc_pca_scores[, 2],
+                       DONOR = axys_pops_meta_panc$DONOR,
+                       Sex = axys_pops_meta_panc$Sex)
+
+pops_adip_pca_data <- data.frame(PC1 = pops_adip_pca_scores[, 1],
+                       PC2 = pops_adip_pca_scores[, 2],
+                       DONOR = axys_pops_meta_adip$DONOR,
+                       Sex = axys_pops_meta_adip$Sex)
+
+
+# Create a ggplot PCA plot with labels
+
+
+
+# png(filename = "2025-02-07_PCA_adip.png", width = 7, height = 5, units = "in", res = 600)
+# dev.off()
+
+ggplot(pops_adip_pca_data, aes(x = PC1, y = PC2, label = DONOR, colour = Sex)) +
+  geom_point(size = 3) +  # Points for PCA scores
+  #scale_color_manual(values = c("orchid4", "steelblue4")) +
+  geom_text_repel(aes(label = DONOR), size = 3, color = "black", max.overlaps = 10, nudge_y = 0.5, 
+                  segment.color = "grey70", segment.alpha = 0.5) +
+  labs(title = "Adipose PCA Score Plot (NIPALS)", 
+    x = paste("PC1 (", pc1_variance_adip, "%)", sep = ""), 
+    y = paste("PC2 (", pc2_variance_adip, "%)", sep = "")) +
+  theme_minimal() +  # Apply a minimal theme
+  theme(
+    axis.title.x = element_text(size = 14),
+    axis.title.y = element_text(size = 14),
+    axis.text.x = element_text(size = 10),
+    axis.text.y = element_text(size = 10),
+    plot.title = element_text(size = 14),
+    legend.position = "right"  
+  )
+
+
+
+
+```
+
+```{r}
+# Variable contribution [PANCREAS]
+
+# Extract loadings and scores from the pcaRes object
+loadings_panc <- pops_panc_pca@loadings   # Extract loadings
+scores_panc <- pops_panc_pca@scores       # Extract scores
+
+# Calculate standard deviations for the PCA (since it's not directly available)
+sdev_panc <- sqrt(apply(scores_panc^2, 2, var))  # Calculate standard deviations for each PC
+
+# Create a prcomp-like object manually
+prcomp_obj_panc <- list(
+  sdev = sdev_panc,
+  rotation = loadings_panc,
+  x = scores_panc
+)
+
+# Assign class to the object to make it compatible with factoextra
+class(prcomp_obj_panc) <- "prcomp"
+
+# Visualize the contribution of each variable to the first principal component (PC1)
+fviz_contrib(prcomp_obj_panc, choice = "var", axes = 1)
+```
+
+```{r}
+# Variable contribution [ADIPOSE]
+
+# Extract loadings and scores from the pcaRes object
+loadings_adip <- pops_adip_pca@loadings   # Extract loadings
+scores_adip <- pops_adip_pca@scores       # Extract scores
+
+# Calculate standard deviations for the PCA (since it's not directly available)
+sdev_adip <- sqrt(apply(scores_adip^2, 2, var))  # Calculate standard deviations for each PC
+
+# Create a prcomp-like object manually
+prcomp_obj_adip <- list(
+  sdev = sdev_adip,
+  rotation = loadings_adip,
+  x = scores_adip
+)
+
+# Assign class to the object to make it compatible with factoextra
+class(prcomp_obj_adip) <- "prcomp"
+
+# Visualize the contribution of each variable to the first principal component (PC1)
+fviz_contrib(prcomp_obj_adip, choice = "var", axes = 1)
+```
+
+
+# Session Info
+
+```{r}
+sessionInfo()
+```
