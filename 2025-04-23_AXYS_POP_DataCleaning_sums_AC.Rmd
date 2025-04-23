@@ -1,0 +1,1316 @@
+---
+title: "AXYS POP data cleaning"
+output: 
+  html_notebook:
+    toc: yes
+---
+
+# Notes
+1. Create 2 master files: (1) Raw (unadjusted) values + blank values, (2) blank-corrected (remove rows for blanks)
+2. Keep all the analytes irrespective of their detectability. The outputs of this data will include analytes that were detectable in less than 50 % of the donors.
+3. For LOD-correction: Assign 1/2 of LOD to true non-detects only (true zeroes); not to values that are below the detection limit or in the NDR (non-detectable range).
+3. Make a correlation plot of biopsy/tissue sizes against pollutant concentrations.
+4. Bin donors by BMI, HbA1c, Sex, Age.
+5. (VF-XMS) and (225) denote the same thing.
+
+```{r include = FALSE}
+# knitr::opts_chunk$set(fig.height = 9, fig.width = 7)
+# knitr::opts_chunk$set(out.height = "\\textheight",  out.width = "\\textwidth")
+```
+
+# Packages
+
+```{r}
+library(tidyverse)
+library(readxl)
+library(cowplot)
+library(ggpubr)
+library(ggrepel)
+library(ggfortify)
+library(stats)
+library(ggplot2)
+```
+
+# Load the data
+
+```{r}
+# List of analytes measured
+chemical_list <- read_csv("../../data/2022-10-18_AXYS_chemicals_list_AC.csv", show_col_types = FALSE) %>%
+  mutate(across(where(is.character), str_squish)) %>%
+  distinct(Compound, .keep_all = TRUE)
+
+# Check for compound duplicates
+dup <- chemical_list %>%
+  group_by(Compound) %>%
+  filter(n() > 2)
+
+# Categorize donors by batch
+donors_batch <- read_csv("../../data/2023-03-21_donors_per_batch.csv", show_col_types = FALSE)
+
+# Metadata
+pops_metadata <- read_csv("../../data/2024-08-22_donor_characteristics_FINAL.csv", show_col_types = FALSE) %>%
+  mutate(BMI_category = case_when(BMI < 24.9 ~ "Lean",
+                                  BMI >= 24.9 & BMI <= 29.9 ~ "Overweight",
+                                  BMI > 29.9 ~ "Obese"),
+         Hba1c_category = case_when(Hba1c < 6 ~ "Normoglycemic",
+                                    Hba1c <= 6.5 ~ "Prediabetic",
+                                    Hba1c > 6.5 ~ "Diabetic"),
+         BMI_category = factor(BMI_category, levels = c("Lean", "Overweight", "Obese")),
+         Hba1c_category = factor(Hba1c_category, levels = c("Normoglycemic", "Prediabetic", "Diabetic")),
+         Sex = as_factor(Sex)) %>%
+  dplyr::select(-Purity)
+```
+
+# Data cleaning
+
+```{r}
+# Combine all excel files into one dataframe
+pops_data <- suppressWarnings(
+  map_dfr(.x = list.files(path = "../../data/AXYS POP DATA_For Jana and Angela/",
+                                      recursive = TRUE,
+                                      pattern = ".xlsx",
+                                      full.names = TRUE),
+          .f = ~read_excel(.x) %>%
+            # Select which columns to keep
+            dplyr::select(SAMPLE_NO, AXYS_ID, COMPOUND, IUPAC_NO, COELUTIONS, LAB_FLAG, CONC_FOUND, DETECTION_LIMIT, UNIT, SAMPLE_SIZE, SAMPLE_SIZE_UNIT) %>%
+            
+            # Remove rows for % recovery and spiked matrix; remove "DL)" from compound names
+            filter(UNIT != "% Recovery", SAMPLE_NO != "Spiked Matrix", !str_detect(COMPOUND, pattern = " DL\\)")) %>%
+            
+            # Create separate columns for donor ID ("DONOR") and tissue type ("TISSUE_TYPE")
+            separate(SAMPLE_NO, into = c("DONOR", "TISSUE_TYPE"), sep = "-", fill = "left") %>%
+            
+            # Make donor and tissue type columns cleaner
+            mutate(DONOR = str_remove(DONOR, pattern = "Donor"), # Remove the word "Donor" from each donor ID for simplicity
+                             TISSUE_TYPE = str_remove(TISSUE_TYPE, pattern = "tissue"), # Remove the word "tissue" from each tissue type for simplicity
+                             across(where(is.character), str_squish)) %>% # Remove extra white space
+            
+            # Remove observations (i.e., rows) from samples with 1500 islets (part of troubleshooting)
+            filter(#TISSUE_TYPE != "1500 islets",
+                   TISSUE_TYPE != "Exocrine"
+                   ) %>%
+            
+            # Naming changes for consistency/simplicity
+            mutate(#TISSUE_TYPE = str_to_sentence(str_remove(TISSUE_TYPE, "\\d{4} ")), # Remove islet numbers used to simplify naming
+                   
+                   # Make lab flag for coelutions more consistent
+                   LAB_FLAG = case_when(LAB_FLAG %in% c("C", "C NDR") & COELUTIONS == "156 + 157" ~ "C156", 
+                                        LAB_FLAG %in% c("C", "C NDR") & COELUTIONS == "180 + 193" ~ "C180",
+                                        TRUE ~ LAB_FLAG),
+                   
+                   # Change concentration found value to 0 is the column CONC_FOUND is NA and there are no coelutetions
+                   CONC_FOUND = case_when(is.na(CONC_FOUND) & is.na(COELUTIONS) ~ 0,
+                                          CONC_FOUND >= 0 ~ CONC_FOUND,
+                                          TRUE ~ CONC_FOUND)),
+          
+          # Add a number to identify which rows came from the same file
+          .id = "File")
+  )
+
+head(pops_data)
+
+# Export csv to manually remove duplicates for compounds with "(225)" or "(VF-XMS)"
+# write_csv(pops_data, "2024-12-09_axys_data_compiled_with_islets.csv")
+```
+
+In the next code chunk, I am loading the file where I manually corrected for duplicates and NQ flags in Excel. Some analytes had 2 rows - one with just its name, and one with its name and "(225)". People from AXYS told us to keep the values from rows with "(225)". I also deleted all observations with an "NQ" flag. Lastly, I am assigning the "File" number as the donor ID for lab blanks to aid in grouping in later steps.
+
+```{r}
+# Load file with correction for compounds with "(225)" - removed the duplicate without 225 + removed NQ flags
+# Replace DONOR ID of lab blanks with the file name for grouping
+pops_data_corrected <- read_csv("../../data/2024-12-09_axys_data_compiled_no_dup_no_NQ_with_islets.csv", show_col_types = FALSE) %>%
+  filter(TISSUE_TYPE == "Lab blank" | TISSUE_TYPE == "Pancreas" | TISSUE_TYPE == "Adipose" | TISSUE_TYPE == "1500 islets" | TISSUE_TYPE == "4000 islets") %>%
+  mutate(File = as.character(File),
+         TISSUE_TYPE = factor(TISSUE_TYPE, levels = c("Lab blank", "Pancreas", "Adipose", "1500 islets", "4000 islets")),
+         DONOR = case_when(is.na(DONOR) & TISSUE_TYPE == "Lab blank" ~ File,
+                           TRUE ~ DONOR))
+
+tmp <- pops_data_corrected %>%
+  filter(TISSUE_TYPE == "4000 islets", COMPOUND == "1,2,3,4,6,7,8-HPCDD")
+```
+
+I replaced the PCB names with their respective congener number for simplicity. I also added a column, "BATCH", to indicate which AXYS analysis batch each donor came from.
+
+```{r}
+# (1) Replace PCB names with their congener number; (2) add "BATCH" number
+pops_data_corrected_simplified_PCB <- left_join(pops_data_corrected, chemical_list, by = c("COMPOUND" = "Compound")) %>%
+  left_join(., donors_batch, by = c("DONOR" = "DONOR")) %>%
+  mutate(COMPOUND = case_when(str_detect(Type, pattern = "PCB") ~ Congener_Number,
+                              str_detect(Type, pattern = "Dioxin") ~ COMPOUND,
+                              str_detect(Type, pattern = "OCP") ~ COMPOUND),
+         BATCH = as.character(BATCH)) %>%
+  dplyr::select(-c(AXYS_ID, Congener_Number, IUPAC_NO, COELUTIONS)) %>%
+  relocate(File, DONOR, TISSUE_TYPE, COMPOUND, Type, Dioxin_similarity, DETECTION_LIMIT, CONC_FOUND, UNIT)
+```
+
+## C flags
+
+There were two pairs of coeluted compounds in the AXYS data: **(1) 156 + 157 ["C156"] and (2) 180 + 193 ["C180"]**. The limit of detection (LOD) and concentration found for coeluted compounds are the same. I deleted compounds with missing LOD to avoid doubling the readings for the coeluted compounds.
+
+```{r}
+# (1) Remove coeluted compounds (those with missing LOD); (2) for CONC_FOUND, change NA values to 0
+pops_cflags_corrected <- pops_data_corrected_simplified_PCB %>%
+    filter(!(is.na(DETECTION_LIMIT))) %>%
+  mutate(CONC_FOUND = case_when(LAB_FLAG %in% c("C", "C NDR") & is.na(CONC_FOUND) ~ 0,
+                                TRUE ~ CONC_FOUND)) %>%
+  relocate(File, DONOR, TISSUE_TYPE, COMPOUND, DETECTION_LIMIT)
+
+tmp <- pops_cflags_corrected %>%
+  filter(str_detect(TISSUE_TYPE, "islets"))
+
+# Export data without blank-correction
+# write_csv(pops_cflags_corrected, "2023-11-22_CIHR_ProjectGrant_data_NOT_blank_or_LOD_corrected_AC.csv")
+```
+
+## Unadjusted concentrations
+
+I am making a separate dataframe for unadjusted concentrations for QA/QC. I.e., to check if lab blank values make sense in comparison with analyte readings, spot outlier donors/analytes, etc.
+
+```{r}
+# Rename dataframe to indicate the CONC_FOUND values are raw (unadjusted)
+pops_unadj_conc <- pops_cflags_corrected %>%
+  dplyr::filter(!str_detect(COMPOUND, "TOTAL"))
+
+# Create a dataframe without lab blanks
+pops_unadj_conc_no_blanks <- pops_cflags_corrected %>%
+  dplyr::filter(TISSUE_TYPE != "Lab blank",
+                !str_detect(COMPOUND, "TOTAL"))
+```
+
+## Adjusted concentrations
+
+I adjusted the analyte concentrations (CONC_FOUND) with the readings from blanks and the reported limit of detection (LOD). Each batch has their own lab blanks. (1) I subtracted the value of the lab blanks from their respective analytes (CONC_BLANK_adj). (2) For analyte concentrations below the blank concentration, I replaced the negative values with "0". (3) For assessing how well analytes were detected, I made a YES/NO column to check if the blank-adjusted concentration is greater than the LOD (IS_BLANK_ADJ_CONC_HIGHER_THAN_LOD). (4) Next, I subtracted 1/2*LOD from the blank-adjusted concentration values (BLANK_and_LOD_adj).
+
+```{r}
+# Calculate blank- and LOD-adjusted concentrations and rename coeluted compounds
+pops_filtered <- pops_cflags_corrected %>%
+  mutate(Half_LOD = 0.5*DETECTION_LIMIT) %>% # Add a column for 1/2 LOD values
+  group_by(File, COMPOUND) %>% # group by File (each "File" has its own lab blanks) and COMPOUND
+  mutate(CONC_BLANK_adj = CONC_FOUND - CONC_FOUND[str_detect(TISSUE_TYPE, "Lab blank")], # Blank-adjusted concentrations
+         
+         # Make negative values = 0
+         CONC_BLANK_adj = case_when(CONC_BLANK_adj < 0 ~ 0, 
+                                    TRUE ~ CONC_BLANK_adj),
+         
+         # Add column to indicate if blank-adjusted concentration is greater than the LOD
+         IS_BLANK_ADJ_CONC_HIGHER_THAN_LOD = CONC_BLANK_adj > DETECTION_LIMIT,
+         
+         # LOD-adjustment: assign 1/2 LOD if the blank-adjusted concentration is NA or below 0
+         BLANK_and_LOD_adj = case_when(is.na(CONC_BLANK_adj) ~ Half_LOD,
+                                        CONC_BLANK_adj <= 0 ~ Half_LOD,
+                                        CONC_BLANK_adj > 0 ~ CONC_BLANK_adj),
+         
+         # Rename coeluted compounds based on lab flag and tissue type for consistency
+         COMPOUND = case_when(LAB_FLAG == "C156" ~ "PCB 156 + 157", 
+                              LAB_FLAG == "C180" ~ "PCB 180 + 193",
+                              LAB_FLAG == "C ND" & COMPOUND == "PCB 180" ~ "PCB 180 + 193",
+                              LAB_FLAG == "C ND" & COMPOUND == "PCB 156" ~ "PCB 156 + 157",
+                              TISSUE_TYPE == "Lab blank" & COMPOUND == "PCB 180" ~ "PCB 180 + 193",
+                              TISSUE_TYPE == "Lab blank" & COMPOUND == "PCB 156" ~ "PCB 156 + 157",
+                              TRUE ~ COMPOUND)) %>%
+  #dplyr::select(-c(IS_BLANK_ADJ_CONC_HIGHER_THAN_LOD)) %>%
+  dplyr::filter(!str_detect(COMPOUND, "TOTAL")) %>%
+  relocate(File, DONOR, TISSUE_TYPE, COMPOUND, UNIT, LAB_FLAG, DETECTION_LIMIT, BLANK_and_LOD_adj)
+
+# Check duplicates
+dup <- pops_filtered %>%
+  group_by(DONOR, TISSUE_TYPE, COMPOUND) %>%
+  filter(n() > 2)
+
+# Removing lab blanks
+pops_filtered_no_blanks <- pops_filtered %>%
+  filter(TISSUE_TYPE != "Lab blank") %>%
+  dplyr::select(-c(SAMPLE_SIZE, SAMPLE_SIZE_UNIT, Half_LOD, CONC_FOUND, BATCH)) %>%
+  relocate(File, DONOR, TISSUE_TYPE, COMPOUND, UNIT, LAB_FLAG, DETECTION_LIMIT, CONC_BLANK_adj, BLANK_and_LOD_adj)
+
+# Export data with blank-correction and LOD-correction
+# write_csv(pops_filtered_no_blanks, "2025-01-28_CIHR_ProjectGrant_data_blank+LOD-corrected_AC.csv")
+```
+
+# Generating dataframe for the Team Grant Website
+
+```{r}
+pops_data_team_grant <- read_csv("../../outputs/2025-01-28_CIHR_ProjectGrant_data_blank+LOD-corrected_AC.csv") %>%
+  dplyr::filter(!str_detect(TISSUE_TYPE, "islets")) %>%
+  dplyr::mutate(
+    DETECTION_LIMIT = case_when(UNIT == "ng/g (wet weight basis)" ~ DETECTION_LIMIT * 1000,
+                           TRUE ~ DETECTION_LIMIT),
+    CONC_BLANK_adj = case_when(UNIT == "ng/g (wet weight basis)" ~ CONC_BLANK_adj * 1000,
+                           TRUE ~ CONC_BLANK_adj),
+    BLANK_and_LOD_adj = case_when(UNIT == "ng/g (wet weight basis)" ~ BLANK_and_LOD_adj * 1000,
+                           TRUE ~ BLANK_and_LOD_adj),
+    CLASS = Type,
+    .keep = "unused") %>%
+  dplyr::select(-c(Dioxin_subtype, Dioxin_similarity, File)) %>%
+  dplyr::mutate(UNIT = "pg/g (wet weight basis)")
+
+# Export data for the Team Grant Website
+# write_csv(pops_data_team_grant, "2025-02-14_AXYS_dioxin+PCB+OCP_concentrations_for_TeamGrantWebsite_AC.csv")
+```
+
+## Calculate average analyte concentrations across donors per tissue
+
+```{r}
+# Average UNADJUSTED analyte concentrations across donors
+pops_avg_unadj <- pops_unadj_conc %>%
+  group_by(TISSUE_TYPE, COMPOUND) %>%
+  summarise(avg_conc = mean(CONC_FOUND, na.rm = TRUE)) %>%
+  as.data.frame()
+
+pops_zero_avg_unadj <- pops_avg_unadj %>%
+  group_by(TISSUE_TYPE, COMPOUND) %>%
+  filter(avg_conc == 0)
+```
+
+I plotted the average UNADJUSTED concentration found in lab blanks, pancreas, and adipose side-by-side for each analyte to visually identify potential outlier analytes.
+
+```{r, fig.width=16}
+# Plot
+ggplot(pops_avg_unadj, aes(x = TISSUE_TYPE, y = avg_conc, color = TISSUE_TYPE)) +
+  geom_point() + 
+  facet_wrap(vars(COMPOUND), ncol = 8, scales = "free", shrink = TRUE) +
+  scale_y_continuous(name = "Average Concentration Found") +
+  scale_color_discrete(name = "Tissue Type") +
+  theme_minimal() +
+  theme(axis.text.x = element_blank(),
+        axis.title.x = element_blank())
+```
+```{r}
+# Average BLANK-ADJUSTED analyte concentrations across donors
+pops_avg <- pops_filtered %>%
+  group_by(TISSUE_TYPE, COMPOUND) %>%
+  summarise(avg_conc = mean(CONC_BLANK_adj, na.rm = TRUE)) %>%
+  as.data.frame()
+
+pops_zero_avg <- pops_avg %>%
+  group_by(TISSUE_TYPE, COMPOUND) %>%
+  filter(avg_conc == 0)
+```
+
+I plotted the average BLANK-ADJUSTED concentration found in lab blanks, pancreas, and adipose side-by-side for each analyte as well for comparison.
+
+```{r, fig.width=16}
+ggplot(pops_avg, aes(x = TISSUE_TYPE, y = avg_conc, color = TISSUE_TYPE)) +
+  geom_point() + 
+  facet_wrap(vars(COMPOUND), ncol = 8, scales = "free", shrink = TRUE) +
+  scale_y_continuous(name = "Average Concentration Found") +
+  scale_color_discrete(name = "Tissue Type") +
+  theme_minimal() +
+  theme(axis.text.x = element_blank(),
+        axis.title.x = element_blank())
+```
+
+# Plot concentrations found per donor in all analytes
+
+I used the **interquartile range (IQR)** method to identify outliers. With this method, values that are below **Q1 - 1.5*IQR** or above **Q3 + 1.5*IQR** are considered outliers.
+
+Quick refresher: 
+- Q1 = 25th percentile
+- Q2 = 50th percentile (i.e., median)
+- Q3 = 75th percentile
+- IQR = Q3 - Q1
+
+In the code below, I identified and filtered for outlier donors within dioxins, PCBs, and OCPs separately. I will use these vectors later when making plots so that donors with outlier values will be labelled.
+
+```{r}
+# Identify outliers using the IQR method by compound type (dioxin, PCB, OCP)
+outliers_dioxin <- pops_filtered_no_blanks %>%
+  filter(Type == "Dioxin") %>%
+  group_by(TISSUE_TYPE, COMPOUND) %>%
+  mutate(Q1 = quantile(BLANK_and_LOD_adj, 0.25),
+         Q3 = quantile(BLANK_and_LOD_adj, 0.75),
+         IQR = Q3 - Q1,
+         lower_bound = Q1 - 1.5 * IQR,
+         upper_bound = Q3 + 1.5 * IQR) %>%
+  filter(BLANK_and_LOD_adj < lower_bound | BLANK_and_LOD_adj > upper_bound)
+
+outliers_pcb <- pops_filtered_no_blanks %>%
+  filter(Type == "PCB") %>%
+  group_by(TISSUE_TYPE, COMPOUND) %>%
+  mutate(Q1 = quantile(BLANK_and_LOD_adj, 0.25),
+         Q3 = quantile(BLANK_and_LOD_adj, 0.75),
+         IQR = Q3 - Q1,
+         lower_bound = Q1 - 1.5 * IQR,
+         upper_bound = Q3 + 1.5 * IQR) %>%
+  filter(BLANK_and_LOD_adj < lower_bound | BLANK_and_LOD_adj > upper_bound)
+
+outliers_ocp <- pops_filtered_no_blanks %>%
+  filter(Type == "OCP") %>%
+  group_by(TISSUE_TYPE, COMPOUND) %>%
+  mutate(Q1 = quantile(BLANK_and_LOD_adj, 0.25),
+         Q3 = quantile(BLANK_and_LOD_adj, 0.75),
+         IQR = Q3 - Q1,
+         lower_bound = Q1 - 1.5 * IQR,
+         upper_bound = Q3 + 1.5 * IQR) %>%
+  filter(BLANK_and_LOD_adj < lower_bound | BLANK_and_LOD_adj > upper_bound)
+
+# Create separate dataframes based on pollutant class
+pop_dioxin <- pops_filtered_no_blanks %>%
+  filter(Type == "Dioxin")
+pop_pcb <- pops_filtered_no_blanks %>%
+  filter(Type == "PCB")
+pop_ocp <- pops_filtered_no_blanks %>%
+  filter(Type == "OCP")
+```
+
+In the figures below, I colour-coded the points based on batch number and used the vectors generated above to label outliers identified using the IQR method. The error bars represent the mean and standard error.
+
+```{r, fig.width = 15} 
+# Plot concentrations per donor grouped by compound type (dioxin, PCB, OCP)
+p_dioxin <- pops_filtered_no_blanks %>%
+  mutate(LAB_FLAG = factor(LAB_FLAG, levels = c("NDR", "NDR D", "ND", "ND D", "D", "G", "NA", "C156", "C180"))) %>%
+  filter(Type == "Dioxin") %>%
+  ggplot(aes(x = TISSUE_TYPE, y = BLANK_and_LOD_adj, color = LAB_FLAG, group = interaction(TISSUE_TYPE, COMPOUND))) +
+  geom_point() +
+  geom_text(data = outliers_dioxin, aes(label = DONOR), size = 3, color = "grey54", position = position_nudge(x = 0.3)) +
+  #geom_text(data = pop_dioxin, aes(label = DONOR), size = 3, color = "grey54", position = position_nudge(x = 0.3)) +
+  stat_summary(fun.data = "mean_se", geom = "errorbar", width = 0.2, position = position_dodge(width = 0.75), color = "grey27", alpha = 0.8) +
+  stat_summary(fun.data = "mean_se", geom = "point", position = position_dodge(width = 0.75), size = 0.5, color = "grey27") +
+  facet_wrap(vars(COMPOUND), ncol = 7, scales = "free", shrink = TRUE) +
+  scale_y_continuous(name = "Concentration Found (unadjusted)") +
+  #scale_color_discrete(name = "Lab Flag") +
+  scale_color_manual(name = "Lab Flag", values = c("red", "tomato", "blue", "steelblue", "palevioletred", "lightpink", "grey")) +
+  scale_x_discrete(labels = c("Pancreas" = "Panc", "Adipose" = "Adip")) +
+  theme_minimal() +
+  ggtitle("Dioxin concentrations in pancreas and adipose") +
+  theme(#axis.text.x = element_blank(),
+        axis.title.x = element_blank(),
+        plot.title = element_text(face = "bold", hjust = 0.5))
+
+p_pcb <- pops_filtered_no_blanks %>%
+  mutate(LAB_FLAG = factor(LAB_FLAG, levels = c("NDR", "NDR D", "ND", "ND D", "D", "G", "NA", "C156", "C180"))) %>%
+  filter(Type == "PCB") %>%
+  ggplot(aes(x = TISSUE_TYPE, y = BLANK_and_LOD_adj, color = LAB_FLAG, group = interaction(TISSUE_TYPE, COMPOUND))) +
+  geom_point() +
+  geom_text(data = outliers_pcb, aes(label = DONOR), size = 3, color = "grey54", position = position_nudge(x = 0.3)) +
+  #geom_text(data = pop_pcb, aes(label = DONOR), size = 3, color = "grey54", position = position_nudge(x = 0.3)) +
+  stat_summary(fun.data = "mean_se", geom = "errorbar", width = 0.2, position = position_dodge(width = 0.75), color = "grey27", alpha = 0.8) +
+  stat_summary(fun.data = "mean_se", geom = "point", position = position_dodge(width = 0.75), size = 0.5, color = "grey27") +
+  facet_wrap(vars(COMPOUND), ncol = 4, scales = "free", shrink = TRUE) +
+  scale_y_continuous(name = "Concentration Found (unadjusted)") +
+  #scale_color_discrete(name = "Lab Flag") +
+  scale_color_manual(name = "Lab Flag", values = c("red", "tomato", "blue", "steelblue", "palevioletred", "lightpink", "grey")) +
+  scale_x_discrete(labels = c("Pancreas" = "Panc", "Adipose" = "Adip")) +
+  theme_minimal() +
+  ggtitle("PCB concentrations in pancreas and adipose") +
+  theme(#axis.text.x = element_blank(),
+        axis.title.x = element_blank(),
+        plot.title = element_text(face = "bold", hjust = 0.5))
+
+p_ocp <- pops_filtered_no_blanks %>%
+  mutate(LAB_FLAG = factor(LAB_FLAG, levels = c("NDR", "NDR D", "ND", "ND D", "D", "G", "NA", "C156", "C180"))) %>%
+  filter(Type == "OCP") %>%
+  ggplot(aes(x = TISSUE_TYPE, y = BLANK_and_LOD_adj, color = LAB_FLAG, group = interaction(TISSUE_TYPE, COMPOUND))) +
+  geom_point() +
+  geom_text(data = outliers_ocp, aes(label = DONOR), size = 3, color = "grey54", position = position_nudge(x = 0.3)) +
+  #geom_text(data = pop_ocp, aes(label = DONOR), size = 3, color = "grey54", position = position_nudge(x = 0.3)) +
+  stat_summary(fun.data = "mean_se", geom = "errorbar", width = 0.2, position = position_dodge(width = 0.75), color = "grey27", alpha = 0.8) +
+  stat_summary(fun.data = "mean_se", geom = "point", position = position_dodge(width = 0.75), size = 0.5, color = "grey27") +
+  facet_wrap(vars(COMPOUND), ncol = 7, scales = "free", shrink = TRUE) +
+  scale_y_continuous(name = "Concentration Found (unadjusted)") +
+  #scale_color_discrete(name = "Lab Flag") +
+  scale_color_manual(name = "Lab Flag", values = c("red", "tomato", "blue", "steelblue", "palevioletred", "lightpink", "grey")) +
+  scale_x_discrete(labels = c("Pancreas" = "Panc", "Adipose" = "Adip")) +
+  theme_minimal() +
+  ggtitle("OCP concentrations in pancreas and adipose") +
+  theme(#axis.text.x = element_blank(),
+        axis.title.x = element_blank(),
+        plot.title = element_text(face = "bold", hjust = 0.5))
+
+#Plots
+p_dioxin
+p_pcb
+p_ocp
+```
+
+# Summarizing lab flags in the data
+
+To get an overview of lab flags in the data, I made a summary file that has a list of analytes, lab flags that have been reported for each analyte, and how many flags were reported for each analyte in each tissue type (lab blank, pancreas, adipose).
+
+```{r}
+pops_flags_per_tissue <- pops_filtered %>%
+  group_by(TISSUE_TYPE, COMPOUND, LAB_FLAG) %>%
+  count() %>%
+  as.data.frame(.) %>%
+  pivot_wider(., names_from = TISSUE_TYPE, values_from = n) %>%
+  relocate(COMPOUND, LAB_FLAG, "Lab blank", Adipose, Pancreas) %>%
+  mutate_if(is.numeric, ~replace(., is.na(.), 0))
+
+# Export table with summary of lab flags per tissue/analyte
+# write_csv(pops_flags, "2023-10-26_CIHR_ProjectGrant_summary_of_lab_flags_per_analyte_per_tissue_AC.csv")
+```
+
+Next, I determined what proportion of donors were non-detects for each analyte.
+
+```{r}
+# Pivot data frame so the lab flags are in columns and analytes are in rows
+pops_flags <- pops_filtered_no_blanks %>%
+  group_by(TISSUE_TYPE, COMPOUND, LAB_FLAG) %>%
+  summarize(across(everything(), first), count = n()) %>%
+  as.data.frame(.) %>%
+  pivot_wider(., names_from = LAB_FLAG, values_from = count) %>%
+  mutate_if(is.numeric, ~replace(., is.na(.), 0)) %>%
+  dplyr::select(File, TISSUE_TYPE, COMPOUND, Type, Dioxin_similarity, NDR, "NDR D", ND, "ND D", "ND G", "D", "G", "NA", "C156", "C180", "C ND")
+
+# Calculate how many donors are available for each compound per tissue type
+pops_donor_total <- pops_filtered_no_blanks %>%
+  group_by(TISSUE_TYPE, COMPOUND) %>%
+  count() %>%
+  as.data.frame(.) %>%
+  mutate(donor_total = n,
+         .keep = c("unused"))
+
+# Combine the dataframe with flag information with the file with donor total
+pops_donor_flags <- left_join(pops_flags, pops_donor_total, by = c("COMPOUND" = "COMPOUND", "TISSUE_TYPE" = "TISSUE_TYPE")) %>%
+  mutate(TISSUE_TYPE = factor(TISSUE_TYPE, levels = c("Lab blank", "Pancreas", "Adipose")))
+
+# Calculate sums for ndr_total and nd_total within each TISSUE_TYPE, COMPOUND, and File
+sums_per_analyte_tissue_batch <- pops_donor_flags %>%
+  group_by(TISSUE_TYPE, COMPOUND, File) %>%
+  summarize(ndr_sum = sum(across(.cols = c("NDR", "NDR D")), na.rm = TRUE),
+            nd_sum = sum(across(.cols = c("ND", "ND D", "ND G", "C ND")), na.rm = TRUE))
+
+# Calculate total sums for each COMPOUND across all batches (i.e., files) within each TISSUE_TYPE
+total_sums_per_analyte_tissue <- sums_per_analyte_tissue_batch %>%
+  group_by(TISSUE_TYPE, COMPOUND) %>%
+  summarize(ndr_total = sum(ndr_sum),
+            nd_total = sum(nd_sum))
+
+# Merge the total sums back to the original dataset (pops_donor_flags)
+pops_prop_nd_ndr_v1 <- pops_donor_flags %>%
+  dplyr::select(TISSUE_TYPE,COMPOUND, Type, Dioxin_similarity, donor_total) %>%
+  distinct(COMPOUND, TISSUE_TYPE, .keep_all = TRUE) %>%
+  left_join(., total_sums_per_analyte_tissue, by = c("COMPOUND" = "COMPOUND", "TISSUE_TYPE" = "TISSUE_TYPE")) %>%
+  mutate(prop_ndr = (ndr_total / donor_total)*100,
+         prop_nd = (nd_total / donor_total)*100) %>%
+  ungroup() %>%
+  mutate_if(is.numeric, round, 2) %>%
+  relocate(TISSUE_TYPE, COMPOUND, Type, Dioxin_similarity, prop_ndr, prop_nd, ndr_total, nd_total, donor_total)
+
+# Check for duplicates
+tmp <- pops_prop_nd_ndr_v1 %>%
+  group_by(TISSUE_TYPE, COMPOUND) %>%
+  filter(n() > 2)
+```
+
+```{r}
+# Alternative code to get %ND and %NDR
+pops_prop_nd_ndr <- pops_filtered_no_blanks %>%
+  ungroup() %>%
+  dplyr::select(TISSUE_TYPE, COMPOUND, Type, Dioxin_similarity, LAB_FLAG) %>%
+  group_by(TISSUE_TYPE, COMPOUND) %>%
+  dplyr::mutate(
+    prop_ndr = sum(LAB_FLAG %in% c("NDR", "NDR D"), na.rm = TRUE) / n() * 100,
+    prop_nd = sum(LAB_FLAG %in% c("ND", "ND D", "ND G", "C ND"), na.rm = TRUE) / n() * 100,
+    Percent_No_NDR_Flag = (n() - sum(LAB_FLAG %in% c("NDR", "NDR D"), na.rm = TRUE)) / n() * 100,
+    Percent_Above_Detection_Limit = (n() - sum(LAB_FLAG %in% c("ND", "ND D", "ND G", "C ND"), na.rm = TRUE)) / n() * 100,
+    Sample_size = n()) %>%
+  dplyr::select(-c(LAB_FLAG, Percent_No_NDR_Flag, Percent_Above_Detection_Limit)) %>%
+  distinct(COMPOUND, TISSUE_TYPE, .keep_all = TRUE) %>%
+  ungroup() %>%
+  mutate_if(is.numeric, round, 2) %>%
+  relocate(TISSUE_TYPE, COMPOUND, Type, Dioxin_similarity, prop_ndr, prop_nd, Sample_size)
+```
+
+
+```{r}
+# Add a column for exclusion
+pops_prop_exc <- pops_prop_nd_ndr %>%
+  mutate(exclusion = case_when(prop_ndr >= 40 | prop_nd >= 50 ~ "EXCLUDE",
+                             TRUE ~ "INCLUDE")) %>%
+  relocate(TISSUE_TYPE, COMPOUND, Type, Dioxin_similarity, prop_ndr, prop_nd, exclusion)
+
+# Calculate how many compounds are excluded per tissue and analyte class
+pops_exc_compounds_sum <- pops_prop_exc %>%
+  filter(exclusion == "EXCLUDE") %>%
+  group_by(TISSUE_TYPE, Type, Dioxin_similarity)  %>%
+  summarise(compounds_excluded = n())
+
+# Calculate the proportion of compounds to be excluded per tissue and analyte class
+pops_prop_exc_inc <- pops_prop_exc %>%
+  group_by(TISSUE_TYPE, Type, Dioxin_similarity) %>%
+  summarize(total_compounds = n(), 
+            excluded_compounds = sum(exclusion == "EXCLUDE"),
+            proportion_excluded = (excluded_compounds / total_compounds)*100)
+
+# Create a list of compounds to be excluded from analyses by individual analyte
+pops_exc_compounds_list <- pops_prop_exc %>%
+  dplyr::filter(exclusion == "EXCLUDE") %>%
+  dplyr::select(TISSUE_TYPE, COMPOUND, Type, Dioxin_similarity, prop_ndr, prop_nd, exclusion)
+
+# Create a list of compounds to be excluded from calculating sums by pollutant class
+pops_exc_compounds_list_ndr <- pops_prop_exc %>%
+  dplyr::filter(prop_ndr > 40) %>%
+  dplyr::select(TISSUE_TYPE, COMPOUND, Type, Dioxin_similarity, prop_ndr, prop_nd, exclusion)
+
+# Create a list of compounds to be included
+pops_inc_compounds_list <- pops_prop_exc %>%
+  dplyr::filter(exclusion == "INCLUDE") %>%
+  dplyr::select(TISSUE_TYPE, COMPOUND, Type, Dioxin_similarity, prop_ndr, prop_nd, exclusion)
+
+#write_csv(pops_inc_compounds_list, "2023-11-28_ProjectGrant_list_of_compounds_to_include.csv")
+#write_csv(pops_exc_compounds_list, "2023-11-28_ProjectGrant_list_of_compounds_to_exclude.csv")
+# write_csv(pops_prop_nd, "2023-10-26_CIHR_ProjectGrant_POPs_lab_flags_counts_per_analyte_per_tissue_AC.csv")
+# write_csv(pops_prop_nd_summary, "2023-10-26_CIHR_ProjectGrant_POPs_proportion_non-detects_per_analyte_per_tissue_AC.csv")
+```
+
+The next figure shows the proportion of non-detects for each analyte in each tissue type.
+
+```{r, fig.width=12, fig.height=5}
+# Sample figures
+ggplot(pops_prop_nd_ndr, aes(x = COMPOUND, y = prop_nd, color = TISSUE_TYPE)) +
+  geom_point(shape = 3, size = 2.5) +
+  scale_color_discrete(name = "Tissue Type") +
+  ylab("Proportion of non-detectable donors") +
+  xlab(NULL) +
+  #scale_x_discrete(limits = rev) +
+  theme_minimal() +
+  theme(axis.title.x = element_text(size=12),
+        axis.title.y = element_text(size=12),
+        axis.text.x = element_text(size=10, angle=70, hjust = 1, margin = margin(r = 0)),
+        axis.text.y = element_text(size=10, angle=0),
+        legend.position = "right")
+```
+
+## Exclude analytes that do not meet inclusion criteria
+
+```{r}
+# Exclude all analytes with prop_ndr > 40 or prop_nd > 50
+pops_exc_nd_ndr <-  anti_join(pops_filtered_no_blanks, pops_exc_compounds_list, by = join_by("TISSUE_TYPE", "COMPOUND"))
+
+# Exclude only analytes with prop_ndr > 40 - this dataframe will be used for calculating sums
+pops_exc_ndr <-  anti_join(pops_filtered_no_blanks, pops_exc_compounds_list_ndr, by = join_by("TISSUE_TYPE", "COMPOUND"))
+
+# Create a dataframe with BLANK-adjusted concentrations (not LOD-adjusted)
+pops_exc_nd_ndr_for_prism <- pops_exc_nd_ndr %>%
+  ungroup() %>%
+  dplyr::select(TISSUE_TYPE, COMPOUND, DONOR, Type, CONC_BLANK_adj) %>%
+  group_by(COMPOUND, DONOR) %>%
+  pivot_wider(names_from = "DONOR", values_from = CONC_BLANK_adj)
+
+# write_csv(pops_exc_nd_ndr_for_prism, "2024-02-29_ProjectGrant_excluded_outliers_only_blank-adj_conc_for_prism.csv")
+# write_csv(pops_exc_nd_ndr, "2024-08-24_ProjectGrant_excluded_outliers_for_single_analyte_analyses.csv")
+# write_csv(pops_exc_ndr, "2024-08-24_ProjectGrant_excluded_outliers_for_summed_analyses.csv")
+```
+
+
+```{r, fig.width = 10}
+# Plot blank-adjusted concentration
+
+pops_exc_nd_ndr %>%
+  filter(Type == "Dioxin") %>%
+  ggplot(., aes(x = TISSUE_TYPE, y = CONC_BLANK_adj, color = TISSUE_TYPE)) +
+  geom_line(aes(group = DONOR), color = "gray", size = 0.2) +
+  geom_point() + 
+  facet_wrap(vars(COMPOUND), ncol = 5, scales = "free", shrink = TRUE) +
+  scale_y_continuous(name = "Concentration Found") +
+  scale_color_discrete(name = "Tissue Type") +
+  theme_minimal() +
+  theme(axis.text.x = element_blank(),
+        axis.title.x = element_blank())
+
+pops_exc_nd_ndr %>%
+  filter(Type == "OCP") %>%
+  ggplot(., aes(x = TISSUE_TYPE, y = CONC_BLANK_adj, color = TISSUE_TYPE)) +
+  geom_line(aes(group = DONOR), color = "gray", size = 0.2) +
+  geom_point() + 
+  facet_wrap(vars(COMPOUND), ncol = 5, scales = "free", shrink = TRUE) +
+  scale_y_continuous(name = "Concentration Found") +
+  scale_color_discrete(name = "Tissue Type") +
+  theme_minimal() +
+  theme(axis.text.x = element_blank(),
+        axis.title.x = element_blank())
+
+pops_exc_nd_ndr %>%
+  filter(Type == "PCB") %>%
+  ggplot(., aes(x = TISSUE_TYPE, y = CONC_BLANK_adj, color = TISSUE_TYPE)) +
+  geom_line(aes(group = DONOR), color = "gray", size = 0.2) +
+  geom_point() + 
+  facet_wrap(vars(COMPOUND), ncol = 5, scales = "free", shrink = TRUE) +
+  scale_y_continuous(name = "Concentration Found") +
+  scale_color_discrete(name = "Tissue Type") +
+  theme_minimal() +
+  theme(axis.text.x = element_blank(),
+        axis.title.x = element_blank())
+
+# ggsave("2024-09-07_adip_panc_before-after_pcb.svg", plot = pcb, width = 10, height = 5, units = "in", dpi = 600, bg = "white", device = "svg")
+```
+
+# Calculate adipose-to-pancreas ratios
+
+```{r}
+# Check which compounds remain after exclusion (EXLUDE: prop_ndr >=40, prop_nd >=50)
+pops_inc <- pops_exc_nd_ndr %>%
+  group_by(TISSUE_TYPE, Type, COMPOUND) %>%
+  summarise()
+
+# write_csv(pops_inc, "2024-08-24_compounds_included_in_single-analyte_analysis_and_panc-to-adip_ratios.csv")
+```
+
+```{r}
+# Blank adjusted only
+pops_exc_blank_adj_panc <- pops_exc_nd_ndr %>%
+  ungroup() %>%
+  filter(TISSUE_TYPE == "Pancreas") %>%
+  dplyr::select(DONOR, COMPOUND, Type, Dioxin_similarity, CONC_BLANK_adj) %>%
+  mutate(CONC_BLANK_adj_panc = CONC_BLANK_adj,
+         .keep = c("unused"))
+
+pops_exc_blank_adj_adip <- pops_exc_nd_ndr %>%
+  ungroup() %>%
+  filter(TISSUE_TYPE == "Adipose") %>%
+  dplyr::select(DONOR, COMPOUND, CONC_BLANK_adj) %>%
+  mutate(CONC_BLANK_adj_adip = CONC_BLANK_adj,
+         .keep = c("unused"))
+
+pops_exc_blank_adj <- left_join(pops_exc_blank_adj_panc, pops_exc_blank_adj_adip, by = c("DONOR" = "DONOR", "COMPOUND" = "COMPOUND")) %>%
+  mutate(adip_panc = CONC_BLANK_adj_adip / CONC_BLANK_adj_panc,
+         panc_adip = CONC_BLANK_adj_panc / CONC_BLANK_adj_adip)
+
+pops_exc_blank_adj_ave <- pops_exc_blank_adj %>%
+  filter(!str_detect(COMPOUND, "TOTAL")) %>%
+  group_by(COMPOUND) %>%
+  summarize(avg_panc = mean(CONC_BLANK_adj_panc, na.rm = TRUE), 
+            avg_adip = mean(CONC_BLANK_adj_adip, na.rm = TRUE)) %>%
+  mutate(adip_panc_avg = avg_adip/avg_panc)
+
+pops_exc_blank_adj_ave_type <- left_join(pops_exc_blank_adj_ave, chemical_list, by = c("COMPOUND" = "Compound")) %>%
+  dplyr::mutate(Type = case_when(str_detect(COMPOUND, pattern = "PCB") ~ "PCB",
+                          TRUE ~ Type)) %>%
+  dplyr::select(-c(Congener_Number, Dioxin_similarity))
+
+# Blank and LOD adjusted
+
+pops_exc_blank_LOD_adj_panc <- pops_exc_nd_ndr %>%
+  ungroup() %>%
+  filter(TISSUE_TYPE == "Pancreas") %>%
+  dplyr::select(DONOR, COMPOUND, Type, Dioxin_similarity, BLANK_and_LOD_adj) %>%
+  mutate(CONC_BLANK_LOD_adj_panc = BLANK_and_LOD_adj,
+         .keep = c("unused"))
+
+pops_exc_blank_LOD_adj_adip <- pops_exc_nd_ndr %>%
+  ungroup() %>%
+  filter(TISSUE_TYPE == "Adipose") %>%
+  dplyr::select(DONOR, COMPOUND, BLANK_and_LOD_adj) %>%
+  mutate(CONC_BLANK_LOD_adj_adip = BLANK_and_LOD_adj,
+         .keep = c("unused"))
+
+pops_exc_blank_LOD_adj <- left_join(pops_exc_blank_LOD_adj_panc, pops_exc_blank_LOD_adj_adip, by = c("DONOR" = "DONOR", "COMPOUND" = "COMPOUND")) %>%
+  mutate(adip_panc = CONC_BLANK_LOD_adj_adip / CONC_BLANK_LOD_adj_panc,
+         panc_adip = CONC_BLANK_LOD_adj_panc / CONC_BLANK_LOD_adj_adip)
+
+pops_exc_blank_LOD_adj_ave <- pops_exc_blank_LOD_adj %>%
+  filter(!str_detect(COMPOUND, "TOTAL")) %>%
+  group_by(COMPOUND) %>%
+  summarize(avg_panc = mean(CONC_BLANK_LOD_adj_panc, na.rm = TRUE), 
+            avg_adip = mean(CONC_BLANK_LOD_adj_adip, na.rm = TRUE)) %>%
+  mutate(adip_panc_avg = avg_adip/avg_panc)
+
+pops_exc_blank_LOD_adj_ave_type <- left_join(pops_exc_blank_LOD_adj_ave, chemical_list, by = c("COMPOUND" = "Compound")) %>%
+  dplyr::mutate(Type = case_when(str_detect(COMPOUND, pattern = "PCB") ~ "PCB",
+                          TRUE ~ Type)) %>%
+  dplyr::select(-c(Congener_Number, Dioxin_similarity))
+
+# Calculate average adip-to-pancreas ratio using mean concentrations across all donors
+
+## Blank-adjusted
+pops_avg_ratio <- pops_exc_nd_ndr %>%
+  group_by(COMPOUND, Type) %>%
+  dplyr::summarise(
+    adip_to_panc = mean(CONC_BLANK_adj[TISSUE_TYPE == "Adipose"]) / mean(CONC_BLANK_adj[TISSUE_TYPE == "Pancreas"])
+  )
+
+## Blank- and LOD- adjusted
+pops_avg_ratio_lod <- pops_exc_nd_ndr %>%
+  group_by(COMPOUND, Type) %>%
+  dplyr::summarise(
+    adip_to_panc = mean(BLANK_and_LOD_adj[TISSUE_TYPE == "Adipose"]) / mean(BLANK_and_LOD_adj[TISSUE_TYPE == "Pancreas"])
+  )
+
+# Calculate average adip-to-pancreas ratio as calculated per donor
+
+## Blank-adjusted
+
+pops_avg_ratio_per_donor <- pops_exc_nd_ndr %>%
+  group_by(DONOR, COMPOUND, Type) %>%
+  dplyr::summarise(
+    adip_to_panc = mean(CONC_BLANK_adj[TISSUE_TYPE == "Adipose"]) / mean(CONC_BLANK_adj[TISSUE_TYPE == "Pancreas"])
+  )
+
+avg_ratio_per_donor_by_compound <- pops_avg_ratio %>%
+  group_by(COMPOUND, Type) %>%
+  dplyr::summarise(
+    avg_adip_to_panc = mean(adip_to_panc, na.rm = TRUE),
+  )
+
+## Blank and LOD adjusted
+pops_avg_ratio_per_donor_lod <- pops_exc_nd_ndr %>%
+  group_by(DONOR, COMPOUND, Type) %>%
+  dplyr::summarise(
+    adip_to_panc = mean(BLANK_and_LOD_adj[TISSUE_TYPE == "Adipose"]) / mean(BLANK_and_LOD_adj[TISSUE_TYPE == "Pancreas"])
+  )
+
+avg_ratio_per_donor_by_compound_lod <- pops_avg_ratio_lod %>%
+  group_by(COMPOUND, Type) %>%
+  dplyr::summarise(
+    avg_adip_to_panc = mean(adip_to_panc, na.rm = TRUE),
+  )
+```
+
+```{r} 
+# Plot ratios
+library(ggsci)
+
+pops_exc_blank_adj %>%
+  #filter(adip_panc <= 1, !str_detect(COMPOUND, "TOTAL")) %>%
+  ggplot(., aes(x = COMPOUND, y = adip_panc, color = Type)) +
+  geom_point() +
+  facet_wrap(vars(Type), ncol = 3, scales = "free_x", shrink = TRUE) +
+  geom_text(aes(label = DONOR), size = 3, color = "grey54", position = position_nudge(x = 0.5)) +
+  geom_hline(yintercept = 1, linetype = "dotted") +
+  scale_y_continuous(name = "Adipose-to-pancreas ratio") +
+  scale_color_cosmic(palette = "hallmarks_light", alpha = 0.5) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 60, hjust = 1, margin = margin(r = 0), size = 8),
+        #axis.text.x = element_blank(),
+        axis.title.x = element_blank())
+
+pops_exc_blank_adj_ave_type %>%
+  ggplot(., aes(x = COMPOUND, y = adip_panc_avg, color = Type)) +
+  geom_point() +
+  facet_wrap(vars(Type), ncol = 3, scales = "free_x", shrink = TRUE) +
+  geom_hline(yintercept = 1, linetype = "dotted") +
+  scale_y_continuous(name = "Average adipose-to-pancreas ratio") +
+  scale_color_cosmic(palette = "hallmarks_light", alpha = 0.5) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 60, hjust = 1, margin = margin(r = 0), size = 8),
+        #axis.text.x = element_blank(),
+        axis.title.x = element_blank())
+
+pops_exc_blank_LOD_adj %>%
+  #filter(adip_panc <= 1, !str_detect(COMPOUND, "TOTAL")) %>%
+  ggplot(., aes(x = COMPOUND, y = adip_panc, color = Type)) +
+  geom_point() +
+  facet_wrap(vars(Type), ncol = 3, scales = "free_x", shrink = TRUE) +
+  geom_text(aes(label = DONOR), size = 3, color = "grey54", position = position_nudge(x = 0.5)) +
+  geom_hline(yintercept = 1, linetype = "dotted") +
+  scale_y_continuous(name = "Adipose-to-pancreas ratio") +
+  scale_color_cosmic(palette = "hallmarks_light", alpha = 0.5) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 60, hjust = 1, margin = margin(r = 0), size = 8),
+        #axis.text.x = element_blank(),
+        axis.title.x = element_blank())
+
+pops_exc_blank_LOD_adj_ave_type %>%
+  ggplot(., aes(x = COMPOUND, y = adip_panc_avg, color = Type)) +
+  geom_point() +
+  facet_wrap(vars(Type), ncol = 3, scales = "free_x", shrink = TRUE) +
+  geom_hline(yintercept = 1, linetype = "dotted") +
+  scale_y_continuous(name = "Average adipose-to-pancreas ratio") +
+  scale_color_cosmic(palette = "hallmarks_light", alpha = 0.5) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 60, hjust = 1, margin = margin(r = 0), size = 8),
+        #axis.text.x = element_blank(),
+        axis.title.x = element_blank())
+
+# ggsave("tmp_ave.png", plot = tmp, width = 8, height = 3.5, units = "in", dpi = 600, bg = "white")
+
+```
+```{r}
+pops_avg_ratio %>%
+  ggplot(., aes(x = COMPOUND, y = adip_to_panc, color = Type)) +
+  geom_point() +
+  facet_wrap(vars(Type), ncol = 3, scales = "free_x", shrink = TRUE) +
+  geom_hline(yintercept = 1, linetype = "dotted") +
+  scale_y_continuous(name = "Average adipose-to-pancreas ratio") +
+  scale_color_cosmic(palette = "hallmarks_light", alpha = 0.5) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 60, hjust = 1, margin = margin(r = 0), size = 8),
+        axis.title.x = element_blank())
+
+pops_avg_ratio_lod %>%
+  ggplot(., aes(x = COMPOUND, y = adip_to_panc, color = Type)) +
+  geom_point() +
+  facet_wrap(vars(Type), ncol = 3, scales = "free_x", shrink = TRUE) +
+  geom_hline(yintercept = 1, linetype = "dotted") +
+  scale_y_continuous(name = "Average adipose-to-pancreas ratio") +
+  scale_color_cosmic(palette = "hallmarks_light", alpha = 0.5) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 60, hjust = 1, margin = margin(r = 0), size = 8),
+        axis.title.x = element_blank())
+
+avg_ratio_per_donor_by_compound_lod %>%
+  ggplot(., aes(x = COMPOUND, y = avg_adip_to_panc, color = Type)) +
+  geom_point() +
+  facet_wrap(vars(Type), ncol = 3, scales = "free_x", shrink = TRUE) +
+  geom_hline(yintercept = 1, linetype = "dotted") +
+  scale_y_continuous(name = "Average adipose-to-pancreas ratio") +
+  scale_color_cosmic(palette = "hallmarks_light", alpha = 0.5) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 60, hjust = 1, margin = margin(r = 0), size = 8),
+        axis.title.x = element_blank())
+```
+### Calculate average analyte concentrations across donors per tissue
+
+```{r}
+# Average analyte concentrations across donors
+pops_exc_avg <- pops_exc_nd_ndr %>%
+  filter(!str_detect(COMPOUND, "TOTAL")) %>%
+  group_by(TISSUE_TYPE, COMPOUND) %>%
+  summarise(avg_conc = mean(BLANK_and_LOD_adj)) %>%
+  ungroup() %>%
+  as.data.frame()
+
+pops_exc_zero_avg <- pops_exc_avg %>%
+  group_by(TISSUE_TYPE, COMPOUND) %>%
+  filter(avg_conc == 0)
+```
+
+Plot the average concentration found in pancreas and adipose side-by-side for each analyte to visually identify potential outlier analytes.
+
+```{r, fig.width=16}
+# Plot
+ggplot(pops_exc_avg, aes(x = TISSUE_TYPE, y = avg_conc, color = TISSUE_TYPE)) +
+  geom_point() + 
+  facet_wrap(vars(COMPOUND), ncol = 10, scales = "free", shrink = TRUE) +
+  scale_y_continuous(name = "Average Concentration Found") +
+  scale_color_discrete(name = "Tissue Type") +
+  theme_minimal() +
+  theme(#axis.text.x = element_text(angle = 45, hjust = 1, margin = margin(r = 0)),
+        axis.text.x = element_blank(),
+        axis.title.x = element_blank())
+```
+## Calculate sums of dioxins, PCBs (dioxin- and non-dioxin-like), and OCPs
+
+For sums, we excluded analytes with %NDR > 40
+
+```{r}
+# Calculating sums per donor
+pops_sums_per_donor <- pops_exc_ndr %>%
+  filter(!str_detect(COMPOUND, "TOTAL"), !str_detect(TISSUE_TYPE, "islets")) %>%
+  group_by(DONOR, TISSUE_TYPE, Dioxin_similarity) %>%
+  mutate(AnalyteSums = sum(BLANK_and_LOD_adj)) %>%
+  group_by(DONOR, TISSUE_TYPE, Dioxin_similarity, AnalyteSums) %>%
+  summarise() %>%
+  pivot_wider(names_from = Dioxin_similarity, values_from = AnalyteSums) %>%
+  mutate(PCB = rowSums(across(c("Dioxin-like", "Non-dioxin-like"))),
+         Dioxin_DioxinlikePCB = rowSums(across(c("Dioxin-like", "Dioxin")))) %>%
+  relocate(DONOR, TISSUE_TYPE, Dioxin, OCP, PCB)
+
+# write_csv(pops_sums_per_donor, "2024-08-24_ProjectGrant_sums_per_donor_AC.csv")
+```
+
+## Sample plots
+
+```{r, fig.width=8}
+# These plots include data from ALL ANALYTES
+pops_filtered %>%
+  filter(TISSUE_TYPE == "Adipose") %>%
+  ggplot(., aes(SAMPLE_SIZE, CONC_BLANK_adj, color = BATCH, shape = Type)) +
+  xlab("Sample size") +
+  ylab("Adjusted concentrations") +
+  ggtitle("Correlation between sample size and pollutant concentrations in adipose") +
+  geom_point() +
+  theme_minimal() +
+  theme(axis.title.x = element_text(size=12),
+        axis.title.y = element_text(size=12),
+        axis.text.x = element_text(size=8, angle=0),
+        axis.text.y = element_text(size=8, angle=0),
+        legend.position = "right")
+
+pops_filtered %>%
+  filter(TISSUE_TYPE == "Pancreas") %>%
+  ggplot(., aes(SAMPLE_SIZE, CONC_BLANK_adj, color = BATCH, shape = Type)) +
+  xlab("Sample size") +
+  ylab("Adjusted concentrations") +
+  ggtitle("Correlation between sample size and pollutant concentrations in whole pancreas") +
+  geom_point() +
+  theme_minimal() +
+  theme(axis.title.x = element_text(size=12),
+        axis.title.y = element_text(size=12),
+        axis.text.x = element_text(size=8, angle=0),
+        axis.text.y = element_text(size=8, angle=0),
+        legend.position = "right")
+```
+
+# Lab blanks
+
+```{r}
+# Loading batch information
+files_batch <- read_csv("../../data/2023-04-11_files_per_batch.csv", show_col_types = FALSE) %>%
+  mutate(File = as.character(File))
+
+# Filtering for lab blanks
+pops_blanks <- pops_filtered %>%
+  dplyr::filter(TISSUE_TYPE == "Lab blank") %>%
+  dplyr::select(-DONOR) %>%
+  mutate(File = as.character(File))
+
+# Adding batch number to lab blanks data
+pops_blanks_batch <- left_join(pops_blanks, files_batch, by = c("File" = "File")) %>%
+  dplyr::select(-BATCH) %>%
+  mutate(BATCH = as.character(Batch),
+         .keep = "unused") %>%
+  relocate(BATCH, TISSUE_TYPE, COMPOUND, Type, Dioxin_similarity, DETECTION_LIMIT, Half_LOD, CONC_BLANK_adj, UNIT, LAB_FLAG, SAMPLE_SIZE, SAMPLE_SIZE_UNIT)
+
+# write_csv(pops_blanks_batch, "2023-10-02_ProjectGrant_blanks+batch_AC.csv")
+```
+
+# Percent recovery
+
+```{r}
+# Correcting for inconsistencies in compound names
+pops_mismatches <- read_csv("../../data/2023-04-11_axys_chemical_list_correction_percent_recovery.csv", show_col_types = FALSE)
+
+# Loading percent recovery data
+pops_recovery <- suppressWarnings(
+  map_dfr(.x = list.files(path = "../../data/AXYS POP DATA_For Jana and Angela/",
+                          recursive = TRUE,
+                          pattern = ".xlsx",
+                          full.names = TRUE),
+          .f = ~read_excel(.x) %>%
+            # Select which columns to keep
+            dplyr::select(SAMPLE_NO, COMPOUND, IUPAC_NO, COELUTIONS, LAB_FLAG, CONC_FOUND, UNIT, SAMPLE_SIZE, SAMPLE_SIZE_UNIT) %>%
+            
+            # Select rows for % recovery and spiked matrix; remove "DL)" from compound names
+            filter(UNIT == "% Recovery", 
+                   SAMPLE_NO != "Spiked Matrix", 
+                   !str_detect(COMPOUND, pattern = " DL\\)")) %>%
+            
+            # Create separate columns for donor ID ("DONOR") and tissue type ("TISSUE_TYPE")
+            separate(SAMPLE_NO, into = c("DONOR", "TISSUE_TYPE"), sep = "-", fill = "left") %>%
+            
+            # Make donor and tissue type columns cleaner
+            mutate(DONOR = str_remove(DONOR, pattern = "Donor"),
+                   TISSUE_TYPE = str_remove(TISSUE_TYPE, pattern = "tissue"),
+                   COMPOUND = str_remove(COMPOUND, pattern = "13C-"),
+                   COMPOUND = str_remove(COMPOUND, pattern = "13C12-"),
+                   COMPOUND = str_remove(COMPOUND, pattern = "37CL-"),
+                   across(where(is.character), str_squish)) %>%
+            
+            # Remove observations (i.e., rows) from samples with 1500 islets (part of troubleshooting)
+            filter(TISSUE_TYPE != "1500 islets", 
+                   TISSUE_TYPE != "Exocrine", 
+                   !is.na(CONC_FOUND)) %>%
+            
+            # Naming changes for consistency/simplicity
+            mutate(
+              #TISSUE_TYPE = str_to_sentence(str_remove(TISSUE_TYPE, "\\d{4} ")), # Remove islet numbers used to simplify naming
+                   
+                   # Make lab flag for coelutions more consistent
+                   LAB_FLAG = case_when(LAB_FLAG == "C V" ~ "C",
+                                        TRUE ~ LAB_FLAG)),
+                   
+          .id = "File"))
+
+# Removing duplicates due to "13C" vs "37Cl" tags (kept values from "13C" tags)
+recovery_no_dup <- pops_recovery %>%
+  distinct(COMPOUND, File, DONOR, TISSUE_TYPE, .keep_all = TRUE) %>%
+  mutate(DONOR = case_when(is.na(DONOR) & TISSUE_TYPE == "Lab blank" ~ File,
+                           TRUE ~ DONOR))
+```
+
+```{r}
+# Replacing PCB names with their congener number
+pops_recovery_simplified <- left_join(recovery_no_dup, pops_mismatches, by = c("COMPOUND" = "Compound_name")) %>%
+  mutate(COMPOUND = case_when(is.na(Replacement) ~ COMPOUND,
+                              TRUE ~ Replacement),
+         .keep = c("unused")) %>%
+  left_join(., chemical_list, by = c("COMPOUND" = "Compound")) %>%
+  mutate(COMPOUND = case_when(str_detect(Type, pattern = "PCB") ~ Congener_Number,
+                              str_detect(Type, pattern = "Dioxin") ~ COMPOUND,
+                              str_detect(Type, pattern = "OCP") ~ COMPOUND,
+                              TRUE ~ COMPOUND)) %>%
+  left_join(., files_batch, by = c("File" = "File")) %>%
+  mutate(Batch = as.character(Batch))
+
+# Adding the metadata
+pops_recovery_simplified_metadata <- left_join(pops_recovery_simplified, pops_metadata, by = c("DONOR" = "Id")) %>%
+  dplyr::select(-c(Congener_Number, COELUTIONS, IUPAC_NO)) %>%
+  relocate(File, DONOR, TISSUE_TYPE, COMPOUND, Type, Dioxin_similarity, CONC_FOUND, UNIT, LAB_FLAG, SAMPLE_SIZE, SAMPLE_SIZE_UNIT)
+
+# Export percent recovery
+# write_csv(pops_recovery_simplified_metadata, "2023-10-02_ProjectGrant_percent_recovery+metadata_AC.csv")
+```
+
+```{r}
+# Percent recovery description table
+desc_table_recovery <- pops_recovery_simplified %>%
+  #dplyr::filter(TISSUE_TYPE != "Lab blank") %>%
+  ungroup() %>%
+  dplyr::select(DONOR, TISSUE_TYPE, Type, COMPOUND, COELUTIONS, CONC_FOUND) %>%
+  group_by(TISSUE_TYPE, COMPOUND, Type) %>%
+  dplyr::summarize(
+    Percent_Recovery_Min = min(CONC_FOUND, na.rm = TRUE),
+    Percent_Recovery_Max = max(CONC_FOUND, na.rm = TRUE),
+    Percent_Recovery_Range = Percent_Recovery_Max - Percent_Recovery_Min,
+    Median = median(CONC_FOUND, na.rm = TRUE),
+    IQR = IQR(CONC_FOUND, na.rm = TRUE),
+    IQR_25th = quantile(CONC_FOUND, probs = 0.25, na.rm = TRUE),
+    IQR_75th = quantile(CONC_FOUND, probs = 0.75, na.rm = TRUE),
+    Percentile_5th = quantile(CONC_FOUND, probs = 0.05, na.rm = TRUE),
+    Percentile_95th = quantile(CONC_FOUND, probs = 0.95, na.rm = TRUE),
+    Sample_size = n()
+  )
+
+# write_csv(desc_table_recovery, "2024-12-12_AXYS_Project_Grant_percent_recovery_description_table_with_blanks.csv")
+```
+
+
+## Percent recovery plots
+
+```{r, fig.width=7}
+# These plots include data from ALL ANALYTES
+
+adipose_dioxins <- pops_recovery_simplified_metadata %>%
+  filter(Type == "Dioxin", TISSUE_TYPE == "Adipose") %>%
+  ggplot(., aes(x = reorder(COMPOUND, desc(COMPOUND)), CONC_FOUND, color = Batch)) +
+  xlab(NULL) +
+  ylab("% Recovery: Adipose dioxins") +
+  geom_point(shape = 21, size = 2, fill = "white", position = position_jitter(width = 0.2, height = 0.2)) +
+  scale_color_manual(name = "Batch", values = c("#D81B60", "#1E88E5", "#FFC107", "#004D40", "#6905C5", "#BFBC94")) +
+  theme(axis.title.x = element_text(size=12),
+        axis.title.y = element_text(size=12),
+        axis.text.x = element_text(size=10, angle=45, hjust = 1, margin = margin(r = 0)),
+        axis.text.y = element_text(size=10, angle=0),
+        legend.key = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        axis.line = element_line(colour = "#565656"))
+
+adipose_dioxins
+
+adipose_ocp <- pops_recovery_simplified_metadata %>%
+  filter(Type == "OCP", TISSUE_TYPE == "Adipose") %>%
+  ggplot(., aes(COMPOUND, CONC_FOUND, color = Batch)) +
+  xlab(NULL) +
+  ylab("% Recovery: Adipose OCPs") +
+  geom_point(shape = 21, size = 2, fill = "white", position = position_jitter(width = 0.2, height = 0.2)) +
+  scale_color_manual(name = "Batch", values = c("#D81B60", "#1E88E5", "#FFC107", "#004D40", "#6905C5", "#BFBC94")) +
+  theme(axis.title.x = element_text(size=12),
+        axis.title.y = element_text(size=12),
+        axis.text.x = element_text(size=10, angle=45, hjust = 1, margin = margin(r = 0)),
+        axis.text.y = element_text(size=10, angle=0),
+        legend.key = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        axis.line = element_line(colour = "#565656"))
+
+adipose_ocp
+
+adipose_pcb <- pops_recovery_simplified_metadata %>%
+  filter(Type == "PCB", TISSUE_TYPE == "Adipose") %>%
+  ggplot(., aes(COMPOUND, CONC_FOUND, color = Batch)) +
+  xlab(NULL) +
+  ylab("% Recovery: Adipose PCBs") +
+  geom_point(shape = 21, size = 2, fill = "white", position = position_jitter(width = 0.2, height = 0.2)) +
+  scale_color_manual(name = "Batch", values = c("#D81B60", "#1E88E5", "#FFC107", "#004D40", "#6905C5", "#BFBC94")) +
+  theme(axis.title.x = element_text(size=12),
+        axis.title.y = element_text(size=12),
+        axis.text.x = element_text(size=10, angle=45, hjust = 1, margin = margin(r = 0)),
+        axis.text.y = element_text(size=10, angle=0),
+        legend.key = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        axis.line = element_line(colour = "#565656"))
+
+adipose_pcb
+
+pancreas_dioxins <- pops_recovery_simplified_metadata %>%
+  filter(Type == "Dioxin", TISSUE_TYPE == "Pancreas") %>%
+  ggplot(., aes(x = reorder(COMPOUND, desc(COMPOUND)), CONC_FOUND, color = Batch)) +
+  xlab(NULL) +
+  ylab("% Recovery: Pancreas dioxins") +
+  geom_point(shape = 21, size = 2, fill = "white", position = position_jitter(width = 0.2, height = 0.2)) +
+  scale_color_manual(name = "Batch", values = c("#1E88E5", "#FFC107", "#004D40", "#6905C5", "#BFBC94")) +
+  theme(axis.title.x = element_text(size=12),
+        axis.title.y = element_text(size=12),
+        axis.text.x = element_text(size=10, angle=45, hjust = 1, margin = margin(r = 0)),
+        axis.text.y = element_text(size=10, angle=0),
+        legend.key = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        axis.line = element_line(colour = "#565656"))
+
+pancreas_dioxins
+
+pancreas_ocp <- pops_recovery_simplified_metadata %>%
+  filter(Type == "OCP", TISSUE_TYPE == "Pancreas") %>%
+  ggplot(., aes(COMPOUND, CONC_FOUND, color = Batch)) +
+  xlab(NULL) +
+  ylab("% Recovery: Pancreas OCPs") +
+  geom_point(shape = 21, size = 2, fill = "white", position = position_jitter(width = 0.2, height = 0.2)) +
+  scale_color_manual(name = "Batch", values = c("#1E88E5", "#FFC107", "#004D40", "#6905C5", "#BFBC94")) +
+  theme(axis.title.x = element_text(size=12),
+        axis.title.y = element_text(size=12),
+        axis.text.x = element_text(size=10, angle=45, hjust = 1, margin = margin(r = 0)),
+        axis.text.y = element_text(size=10, angle=0),
+        legend.key = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        axis.line = element_line(colour = "#565656"))
+
+pancreas_ocp
+
+pancreas_pcb <- pops_recovery_simplified_metadata %>%
+  filter(Type == "PCB", TISSUE_TYPE == "Pancreas") %>%
+  ggplot(., aes(COMPOUND, CONC_FOUND, color = Batch)) +
+  xlab(NULL) +
+  ylab("% Recovery: Pancreas PCBs") +
+  geom_point(shape = 21, size = 2, fill = "white", position = position_jitter(width = 0.2, height = 0.2)) +
+  scale_color_manual(name = "Batch", values = c("#1E88E5", "#FFC107", "#004D40", "#6905C5", "#BFBC94")) +
+  theme(axis.title.x = element_text(size=12),
+        axis.title.y = element_text(size=12),
+        axis.text.x = element_text(size=10, angle=45, hjust = 1, margin = margin(r = 0)),
+        axis.text.y = element_text(size=10, angle=0),
+        legend.key = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        axis.line = element_line(colour = "#565656"))
+
+pancreas_pcb
+```
+
+
+```{r, fig.width = 20, fig.height= 9}
+# Combining all plots in one grid
+recovery_legend <- get_legend(adipose_dioxins + theme(legend.position = "right", legend.box.margin = margin(0, 0, 0, 12), legend.justification = c(0, 0.98)))
+
+combined_recovery <- plot_grid(
+  adipose_dioxins + theme(legend.position="none"), 
+  adipose_ocp + theme(legend.position="none"), 
+  adipose_pcb + theme(legend.position="none"),
+  pancreas_dioxins + theme(legend.position="none"), 
+  pancreas_ocp + theme(legend.position="none"), 
+  pancreas_pcb + theme(legend.position="none"),
+  labels = "AUTO", nrow = 2, ncol = 3, align = "h", axis = "b", rel_widths = c(1.1, 1.9, 1)
+)
+
+plot_grid(combined_recovery, recovery_legend, rel_widths = c(4, 0.3), align = "v", axis = "t")
+```
+
+# Data overview
+
+```{r}
+library(gtsummary)
+
+tbl_summary(pops_metadata,
+            include = c(Age, BMI, Hba1c),
+            type = all_continuous() ~ "continuous2",
+            statistic = all_continuous() ~ c("{median} ({p25}, {p75})", "{min}, {max}"),
+            by = Sex)
+
+# Description table
+
+# On Jan 28, 2025, I changed the concentration values used from CONC_BLANK_adj to BLANK_and_LOD_adj
+desc_table <- pops_filtered_no_blanks %>%
+  ungroup() %>%
+  dplyr::select(DONOR, TISSUE_TYPE, Type, COMPOUND, DETECTION_LIMIT, CONC_BLANK_adj, BLANK_and_LOD_adj, LAB_FLAG) %>%
+  group_by(TISSUE_TYPE, COMPOUND, Type) %>%
+  dplyr::summarize(
+    Conc_Min = min(BLANK_and_LOD_adj, na.rm = TRUE),
+    Conc_Max = max(BLANK_and_LOD_adj, na.rm = TRUE),
+    Median = median(BLANK_and_LOD_adj, na.rm = TRUE),
+    IQR = IQR(BLANK_and_LOD_adj, na.rm = TRUE),
+    IQR_25th = quantile(BLANK_and_LOD_adj, probs = 0.25, na.rm = TRUE),
+    IQR_75th = quantile(BLANK_and_LOD_adj, probs = 0.75, na.rm = TRUE),
+    Percentile_5th = quantile(BLANK_and_LOD_adj, probs = 0.05, na.rm = TRUE),
+    Percentile_95th = quantile(BLANK_and_LOD_adj, probs = 0.95, na.rm = TRUE),
+    Detection_Limit_Range = max(DETECTION_LIMIT, na.rm = TRUE) - min(DETECTION_LIMIT, na.rm = TRUE),
+    Detection_Limit_Min = min(DETECTION_LIMIT, na.rm = TRUE),
+    Detection_Limit_Max = max(DETECTION_LIMIT, na.rm = TRUE),
+    Percent_No_ND = (n() - sum(LAB_FLAG %in% c("ND", "ND D", "ND G", "C ND"), na.rm = TRUE)) / n() * 100,
+    #Percent_Above_SDL = (n() - sum(CONC_BLANK_adj < DETECTION_LIMIT, na.rm = TRUE)) / n() * 100,
+    #Percent_Above_zero = sum(CONC_BLANK_adj > 0, na.rm = TRUE) / n() * 100,
+    Percent_No_NDR_Flag = (n() - sum(LAB_FLAG %in% c("NDR", "NDR D", "C NDR"), na.rm = TRUE)) / n() * 100,
+    Sample_size = n()
+  )
+
+desc_table_blanks <- pops_filtered %>%
+  ungroup() %>%
+  dplyr::filter(TISSUE_TYPE == "Lab blank") %>%
+  dplyr::select(DONOR, TISSUE_TYPE, Type, COMPOUND, DETECTION_LIMIT, CONC_FOUND, LAB_FLAG) %>%
+  group_by(TISSUE_TYPE, COMPOUND, Type) %>%
+  dplyr::summarize(
+    Conc_Min = min(CONC_FOUND, na.rm = TRUE),
+    Conc_Max = max(CONC_FOUND, na.rm = TRUE),
+    Median = median(CONC_FOUND, na.rm = TRUE),
+    IQR = IQR(CONC_FOUND, na.rm = TRUE),
+    IQR_25th = quantile(CONC_FOUND, probs = 0.25, na.rm = TRUE),
+    IQR_75th = quantile(CONC_FOUND, probs = 0.75, na.rm = TRUE),
+    Percentile_5th = quantile(CONC_FOUND, probs = 0.05, na.rm = TRUE),
+    Percentile_95th = quantile(CONC_FOUND, probs = 0.95, na.rm = TRUE),
+    Detection_Limit_Range = max(DETECTION_LIMIT, na.rm = TRUE) - min(DETECTION_LIMIT, na.rm = TRUE),
+    Detection_Limit_Min = min(DETECTION_LIMIT, na.rm = TRUE),
+    Detection_Limit_Max = max(DETECTION_LIMIT, na.rm = TRUE),
+    Percent_No_ND = (n() - sum(LAB_FLAG %in% c("ND", "ND D", "ND G", "C ND"), na.rm = TRUE)) / n() * 100,
+    Percent_Above_SDL = (n() - sum(CONC_FOUND < DETECTION_LIMIT, na.rm = TRUE)) / n() * 100,
+    Percent_No_NDR_Flag = (n() - sum(LAB_FLAG %in% c("NDR", "NDR D", "C NDR"), na.rm = TRUE)) / n() * 100,
+    Sample_size = n()
+  )
+
+# write_csv(desc_table, "2025-01-28_AXYS_POPS_description_table_with_islets_AC.csv")
+# write_csv(desc_table_blanks, "2024-12-12_AXYS_POPS_description_table_with_islets_and_blanks_AC.csv")
+```
+
+## General data characteristics (sample plots)
+
+```{r, fig.width=7}
+#hist(pops_metadata$Age, main = "Histogram of Age", xlab = "Age") #left-skewed
+# mean(pops_metadata$Age) # 50.45161
+# var(pops_metadata$Age) # 156.4559; var > mean = overdispersed
+
+ggplot(pops_metadata, aes(BMI_category, fill = Sex)) +
+  geom_bar() +
+  ylab("Count") +
+  xlab("BMI category") +
+  theme_minimal() +
+  theme(axis.title.x = element_text(size=14),
+        axis.title.y = element_text(size=14),
+        axis.text.x = element_text(size=10, angle=0),
+        axis.text.y = element_text(size=10, angle=0),
+        legend.position = "right")
+
+ggplot(pops_metadata, aes(Hba1c_category, fill = Sex)) +
+  geom_bar() +
+  ylab("Count") +
+  xlab("BMI category") +
+  theme_minimal() +
+  theme(axis.title.x = element_text(size=14),
+        axis.title.y = element_text(size=14),
+        axis.text.x = element_text(size=10, angle=0),
+        axis.text.y = element_text(size=10, angle=0),
+        legend.position = "right")
+
+ggplot(pops_metadata, aes(Age, BMI, color = Sex)) +
+  geom_point() +
+  geom_smooth(method=lm) +
+  stat_cor(method = "spearman", cor.coef.name = "rho") +
+  theme_minimal() +
+  theme(axis.title.x = element_text(size=14),
+        axis.title.y = element_text(size=14),
+        axis.text.x = element_text(size=10, angle=0),
+        axis.text.y = element_text(size=10, angle=0),
+        legend.position = "right")
+
+ggplot(pops_metadata, aes(Age, Hba1c, color = Sex)) +
+  geom_point() +
+  geom_smooth(method=lm) +
+  stat_cor(method = "spearman", cor.coef.name = "rho") +
+  theme_minimal() +
+  theme(axis.title.x = element_text(size=14),
+        axis.title.y = element_text(size=14),
+        axis.text.x = element_text(size=10, angle=0),
+        axis.text.y = element_text(size=10, angle=0),
+        legend.position = "right")
+```
+
+```{r}
+sessionInfo()
+```
