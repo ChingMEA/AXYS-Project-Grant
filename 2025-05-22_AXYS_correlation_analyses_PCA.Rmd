@@ -1,0 +1,234 @@
+---
+title: "AXYS correlations: PCA analyses"
+author: "Angela Ching"
+date: "`r Sys.Date()`"
+output: 
+  html_notebook:
+    toc: yes
+---
+
+# Packages
+
+```{r}
+library(tidyverse)
+library(readxl)
+library(ggplot2)
+
+# For PCA analysis
+library(ggrepel)
+library(factoextra)
+library(pcaMethods)
+```
+
+# Load AXYS data
+
+```{r AXYS_data}
+# load chemical list
+chem_list <- read_csv("../../../data/2022-10-18_AXYS_chemicals_list_AC.csv") %>%
+  dplyr::select(Compound, Dioxin_subtype)
+
+# load AXYS data
+axys_pops <- read_csv("../../../outputs/2024-08-24_ProjectGrant_excluded_outliers_for_single_analyte_analyses.csv") %>%
+  dplyr::select(-c(CONC_BLANK_adj, IS_BLANK_ADJ_CONC_HIGHER_THAN_LOD)) %>%
+  mutate(BLANK_and_LOD_adj = as.numeric(BLANK_and_LOD_adj),
+         File = factor(File),
+         COMPOUND = case_when(str_detect(COMPOUND, "TOTAL") ~ str_to_sentence(COMPOUND),
+                              str_detect(COMPOUND, " Epoxide") ~ str_to_sentence(COMPOUND),
+                              TRUE ~ COMPOUND),
+         across(where(is.character), str_squish))
+
+axys_pops_2 <- axys_pops %>%
+  dplyr::select(-c(File, LAB_FLAG, DETECTION_LIMIT)) %>%
+  mutate(across(where(is.character), str_squish))
+
+# load AXYS sum data
+axys_sums <- read_csv("../../../outputs/2024-08-24_ProjectGrant_sums_per_donor_AC.csv")
+
+# load AXYS donor metadata
+axys_metadata <- read_csv("../../../data/2024-08-22_donor_characteristics_FINAL.csv", show_col_types = FALSE) %>%
+  mutate(BMI_category = case_when(BMI < 24.9 ~ "Lean",
+                                  BMI >= 24.9 & BMI <= 29.9 ~ "Overweight",
+                                  BMI > 29.9 ~ "Obese"),
+         Hba1c_category = case_when(Hba1c < 6 ~ "Normoglycemic",
+                                    Hba1c <= 6.5 ~ "Prediabetic",
+                                    Hba1c > 6.5 ~ "Diabetic"),
+         BMI_category = factor(BMI_category, levels = c("Lean", "Overweight", "Obese")),
+         Hba1c_category = factor(Hba1c_category, levels = c("Normoglycemic", "Prediabetic", "Diabetic")),
+         Sex = as_factor(Sex),
+         Diabetes_status = as_factor(Diabetes_status)) %>%
+  dplyr::select(-Purity)
+
+# Donor IDs
+axys_donors <- axys_metadata %>%
+  dplyr::select(Id)
+```
+
+```{r}
+subset_tissue <- function(tissue) {
+  axys_pops_2 %>%
+    dplyr::filter(!str_detect(COMPOUND, "Total"), TISSUE_TYPE == tissue) %>%
+    dplyr::select(DONOR, COMPOUND, BLANK_and_LOD_adj) %>%
+    group_by(DONOR) %>%
+    pivot_wider(names_from = COMPOUND, values_from = BLANK_and_LOD_adj) %>%
+    ungroup()
+}
+
+axys_pops_panc <- subset_tissue("Pancreas")
+axys_pops_adip <- subset_tissue("Adipose")
+```
+
+```{r}
+# Combine axys data with metadata
+axys_pops_meta_panc <- axys_pops_panc %>%
+  left_join(., axys_metadata, by = c("DONOR" = "Id")) %>%
+  dplyr::select(-Hba1c_category)
+
+axys_pops_meta_adip <- axys_pops_adip %>%
+  left_join(., axys_metadata, by = c("DONOR" = "Id")) %>%
+  dplyr::select(-Hba1c_category)
+```
+
+# PCA analyses
+
+```{r}
+# Using pcaMethods to perform PCA while having NA values
+
+# Perform PCA using the NIPALS algorithm
+pops_panc_pca <- pca(axys_pops_meta_panc, method = "nipals", nPcs = 3, scale = "uv", center = TRUE)
+
+pops_adip_pca <- pca(axys_pops_meta_adip, method = "nipals", nPcs = 3, scale = "uv", center = TRUE)
+
+# View the summary of the PCA results
+summary(pops_panc_pca)
+summary(pops_adip_pca)
+
+# Extract the scores (principal components)
+pops_panc_pca_scores <- scores(pops_panc_pca)
+pops_adip_pca_scores <- scores(pops_adip_pca)
+
+# Extract the loadings
+pops_panc_pca_loadings <- loadings(pops_panc_pca)
+pops_adip_pca_loadings <- loadings(pops_adip_pca)
+
+# Extract the R^2 values for the variance explained
+explained_variance_panc <- pops_panc_pca@R2
+explained_variance_adip <- pops_adip_pca@R2
+
+# Cumulative R^2
+cumulative_variance_panc <- cumsum(explained_variance_panc)
+cumulative_variance_adip <- cumsum(explained_variance_adip)
+
+# Extracting variance explained for PC1 and PC2
+pc1_variance_panc <- round(explained_variance_panc[1] * 100, 2)
+pc2_variance_panc <- round(explained_variance_panc[2] * 100, 2)
+
+pc1_variance_adip <- round(explained_variance_adip[1] * 100, 2)
+pc2_variance_adip <- round(explained_variance_adip[2] * 100, 2)
+
+# Plot the PCA results (scores)
+plot(pops_panc_pca_scores[, 1], pops_panc_pca_scores[, 2],
+     xlab = "PC1",
+     ylab = "PC2",
+     main = "PCA Score Plot (NIPALS)",
+     pch = 19, col = "grey50")
+
+text(pops_panc_pca_scores[, 1], pops_panc_pca_scores[, 2], labels = axys_pops_meta_panc$DONOR, pos = 3, cex = 0.8, col = "black")
+
+plot(pops_adip_pca_scores[, 1], pops_adip_pca_scores[, 2],
+     xlab = "PC1",
+     ylab = "PC2",
+     main = "PCA Score Plot (NIPALS)",
+     pch = 19, col = "grey20")
+
+text(pops_adip_pca_scores[, 1], pops_adip_pca_scores[, 2], labels = axys_pops_meta_adip$DONOR, pos = 3, cex = 0.8, col = "black")
+
+# Add a biplot for visualization (optional)
+biplot(pops_panc_pca, cex = 0.7)
+biplot(pops_adip_pca, cex = 0.7)
+
+# Plot PCA
+pops_panc_pca_data <- data.frame(PC1 = pops_panc_pca_scores[, 1],
+                       PC2 = pops_panc_pca_scores[, 2],
+                       DONOR = axys_pops_meta_panc$DONOR,
+                       Sex = axys_pops_meta_panc$Sex)
+
+pops_adip_pca_data <- data.frame(PC1 = pops_adip_pca_scores[, 1],
+                       PC2 = pops_adip_pca_scores[, 2],
+                       DONOR = axys_pops_meta_adip$DONOR,
+                       Sex = axys_pops_meta_adip$Sex)
+
+# png(filename = "2025-02-07_PCA_adip.png", width = 7, height = 5, units = "in", res = 600)
+# dev.off()
+
+ggplot(pops_adip_pca_data, aes(x = PC1, y = PC2, label = DONOR, colour = Sex)) +
+  geom_point(size = 3) +  # Points for PCA scores
+  #scale_color_manual(values = c("orchid4", "steelblue4")) +
+  geom_text_repel(aes(label = DONOR), size = 3, color = "black", max.overlaps = 10, nudge_y = 0.5, 
+                  segment.color = "grey70", segment.alpha = 0.5) +
+  labs(title = "Adipose PCA Score Plot (NIPALS)", 
+    x = paste("PC1 (", pc1_variance_adip, "%)", sep = ""), 
+    y = paste("PC2 (", pc2_variance_adip, "%)", sep = "")) +
+  theme_minimal() +  # Apply a minimal theme
+  theme(
+    axis.title.x = element_text(size = 14),
+    axis.title.y = element_text(size = 14),
+    axis.text.x = element_text(size = 10),
+    axis.text.y = element_text(size = 10),
+    plot.title = element_text(size = 14),
+    legend.position = "right"  
+  )
+```
+
+```{r}
+# Variable contribution [PANCREAS]
+
+# Extract loadings and scores from the pcaRes object
+loadings_panc <- pops_panc_pca@loadings   # Extract loadings
+scores_panc <- pops_panc_pca@scores       # Extract scores
+
+# Calculate standard deviations for the PCA (since it's not directly available)
+sdev_panc <- sqrt(apply(scores_panc^2, 2, var))  # Calculate standard deviations for each PC
+
+# Create a prcomp-like object manually
+prcomp_obj_panc <- list(
+  sdev = sdev_panc,
+  rotation = loadings_panc,
+  x = scores_panc
+)
+
+# Assign class to the object to make it compatible with factoextra
+class(prcomp_obj_panc) <- "prcomp"
+
+# Visualize the contribution of each variable to the first principal component (PC1)
+fviz_contrib(prcomp_obj_panc, choice = "var", axes = 1)
+```
+
+```{r}
+# Variable contribution [ADIPOSE]
+
+# Extract loadings and scores from the pcaRes object
+loadings_adip <- pops_adip_pca@loadings   # Extract loadings
+scores_adip <- pops_adip_pca@scores       # Extract scores
+
+# Calculate standard deviations for the PCA (since it's not directly available)
+sdev_adip <- sqrt(apply(scores_adip^2, 2, var))  # Calculate standard deviations for each PC
+
+# Create a prcomp-like object manually
+prcomp_obj_adip <- list(
+  sdev = sdev_adip,
+  rotation = loadings_adip,
+  x = scores_adip
+)
+
+# Assign class to the object to make it compatible with factoextra
+class(prcomp_obj_adip) <- "prcomp"
+
+# Visualize the contribution of each variable to the first principal component (PC1)
+fviz_contrib(prcomp_obj_adip, choice = "var", axes = 1)
+```
+
+# Session Info
+
+```{r}
+sessionInfo()
+```
