@@ -8,14 +8,11 @@
 .Rproj.user/
 .Rproj.user/**
 .Rproj.user/*
-
-# RStudio project files (optional)
 *.Rproj
 
 ###############
 # Data Files  #
 ###############
-# REAL DATA SHOULD NOT BE VERSIONED
 data/**/*.csv
 data/**/*.xlsx
 data/**/*.xls
@@ -25,17 +22,12 @@ data/**/*.rds
 data/**/*.RData
 data/**/*.Rda
 
-# Allow the example synthetic data subfolder to be committed
-!data/example/
-!data/example/*
-
-##########################
-# Outputs / Results / Plots
-##########################
+#############################
+# Outputs / Results / Plots #
+#############################
 outputs/
 outputs/*
 
-# Common output file types you never want in Git
 *.pdf
 *.png
 *.jpg
@@ -51,9 +43,9 @@ outputs/*
 *.tsv
 *.xlsx
 
-##########################
-# Logs, cache, temp files
-##########################
+###########################
+# Logs, cache, temp files #
+###########################
 *.log
 *.tmp
 *.cache
@@ -68,20 +60,14 @@ cache/
 *.utf8.md
 *.knit.md
 
-##########################
-# Python (if ever used)  #
-##########################
-__pycache__/
-*.pyc
-
-##########################
-# Mac / System Files
-##########################
+######################
+# Mac / System Files #
+######################
 .DS_Store
 Thumbs.db
 
-##########################
-# SLURM / HPC outputs
-##########################
+#######################
+# SLURM / HPC outputs #
+#######################
 slurm-*.out
 slurm-*.err
