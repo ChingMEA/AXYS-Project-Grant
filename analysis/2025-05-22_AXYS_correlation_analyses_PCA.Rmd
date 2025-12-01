@@ -1,0 +1,1028 @@
+---
+title: "AXYS correlations: PCA analyses"
+author: "Angela Ching"
+date: "`r Sys.Date()`"
+output: 
+  html_notebook:
+    toc: yes
+---
+
+# Packages
+
+```{r}
+library(tidyverse)
+library(readxl)
+library(ggplot2)
+library(janitor)      # for data cleaning
+
+# For PCA analysis
+library(ggrepel)
+library(factoextra)
+library(pcaMethods)
+```
+
+```{r}
+# Load necessary functions
+source(here::here("functions", "pca_functions.R"))
+```
+
+# Load AXYS data
+
+```{r AXYS_data}
+# load chemical list
+chem_list <- read_csv(here::here("data", "2022-10-18_AXYS_chemicals_list_AC.csv")) %>%
+  dplyr::select(Compound, Dioxin_subtype)
+
+# load AXYS data
+axys_pops <- read_csv(here::here("outputs", "2024-08-24_ProjectGrant_excluded_outliers_for_single_analyte_analyses.csv")) %>%
+  dplyr::select(-c(CONC_BLANK_adj, IS_BLANK_ADJ_CONC_HIGHER_THAN_LOD)) %>%
+  mutate(BLANK_and_LOD_adj = as.numeric(BLANK_and_LOD_adj),
+         File = factor(File),
+         COMPOUND = case_when(str_detect(COMPOUND, "TOTAL") ~ str_to_sentence(COMPOUND),
+                              str_detect(COMPOUND, " Epoxide") ~ str_to_sentence(COMPOUND),
+                              TRUE ~ COMPOUND),
+         across(where(is.character), str_squish))
+
+axys_pops_2 <- axys_pops %>%
+  dplyr::select(-c(File, LAB_FLAG, DETECTION_LIMIT)) %>%
+  mutate(across(where(is.character), str_squish))
+
+# load AXYS sum data
+axys_sums <- read_csv(here::here("outputs", "2024-08-24_ProjectGrant_sums_per_donor_AC.csv"))
+
+# load AXYS donor metadata
+axys_metadata <- read_csv(here::here("data", "2024-08-22_donor_characteristics_FINAL.csv"), show_col_types = FALSE) %>%
+  mutate(BMI_category = case_when(BMI < 24.9 ~ "Lean",
+                                  BMI >= 24.9 & BMI <= 29.9 ~ "Overweight",
+                                  BMI > 29.9 ~ "Obese"),
+         Hba1c_category = case_when(Hba1c < 6 ~ "Normoglycemic",
+                                    Hba1c <= 6.5 ~ "Prediabetic",
+                                    Hba1c > 6.5 ~ "Diabetic"),
+         BMI_category = factor(BMI_category, levels = c("Lean", "Overweight", "Obese")),
+         Hba1c_category = factor(Hba1c_category, levels = c("Normoglycemic", "Prediabetic", "Diabetic")),
+         Sex = as_factor(Sex),
+         Diabetes_status = as_factor(Diabetes_status)) %>%
+  dplyr::select(-Purity)
+
+# Donor IDs
+axys_donors <- axys_metadata %>%
+  dplyr::select(Id)
+
+# Load islet processing details
+processing_info <- read_csv(here::here("data", "Perifusion+GSIS", "2025-07-25_team_grant_website_isolation_info.csv")) %>%
+  dplyr::select(record_id, coldischemiatime, digesttime, puritypercentage, isletparticleindex) %>%
+  dplyr::mutate(Donor = record_id,
+                .keep = c("unused")) %>%
+  dplyr::relocate(Donor) %>%
+  dplyr::filter(Donor %in% axys_donors$Id)
+
+# Add islet processing details to metadata
+axys_metadata2 <- axys_metadata %>%
+  left_join(processing_info, by = c("Id" = "Donor"))
+```
+
+```{r}
+subset_tissue <- function(tissue) {
+  axys_pops_2 %>%
+    dplyr::filter(!str_detect(COMPOUND, "Total"), TISSUE_TYPE == tissue) %>%
+    dplyr::select(DONOR, COMPOUND, BLANK_and_LOD_adj) %>%
+    group_by(DONOR) %>%
+    pivot_wider(names_from = COMPOUND, values_from = BLANK_and_LOD_adj) %>%
+    ungroup()
+}
+
+axys_pops_panc <- subset_tissue("Pancreas")
+axys_pops_adip <- subset_tissue("Adipose")
+```
+
+# Load static GSIS and perifusion data
+
+```{r}
+# load GSIS data from ADI
+gsis_adi_param <- read_excel(here::here("data", "Perifusion+GSIS", "2024-05-18_IsletCore_GSIS_from_TeamGrant_website.xlsx")) %>%
+  dplyr::mutate(Cond = factor(Cond, levels = c("1", "2", "3")),
+                replicate = as.character(replicate))
+
+gsis_adi_ave <- gsis_adi_param %>%
+  dplyr::mutate_at(c(4:ncol(.)), as.numeric) %>%
+  group_by(Donor, Cond) %>%
+  dplyr::mutate(InsulinContent_IsletCore = mean(InsulinContent),
+                LG_IsletCore = mean(LG, na.rm = TRUE),
+                HG_IsletCore = mean(HG, na.rm = TRUE),
+                SI_IsletCore = mean(SI, na.rm = TRUE),
+                .keep = c("unused")) %>%
+  distinct(Donor, Cond, .keep_all = TRUE) %>%
+  dplyr::select(-replicate) %>%
+  ungroup()
+  
+gsis_adi_wide <- gsis_adi_ave %>%
+  pivot_wider(names_from = Cond, values_from = c(InsulinContent_IsletCore, LG_IsletCore, HG_IsletCore, SI_IsletCore)) %>%
+  relocate(Donor, InsulinContent_IsletCore_1, LG_IsletCore_1, HG_IsletCore_1, SI_IsletCore_1,
+           InsulinContent_IsletCore_2, LG_IsletCore_2, HG_IsletCore_2, SI_IsletCore_2,
+           InsulinContent_IsletCore_3, LG_IsletCore_3, HG_IsletCore_3, SI_IsletCore_3)
+
+gsis_adi_preInsCont <- read_csv(here::here("data", "Perifusion+GSIS", "2025-07-25_team_grant_website_isolation_info.csv")) %>%
+  dplyr::select("record_id", "insulincontent") %>%
+  dplyr::mutate(PreInsulinContent_IsletCore = insulincontent,
+                .keep = c("unused"))
+
+# Combine pre-GSIS total insulin content with the rest of the dataset
+gsis_adi <- gsis_adi_wide %>%
+  left_join(., gsis_adi_preInsCont, by = c("Donor" = "record_id")) %>%
+  dplyr::filter(Donor %in% axys_donors$Id) %>%
+  dplyr::mutate(across(2:ncol(.), as.numeric))
+```
+
+```{r}
+# Load perifusion data from Jelena Kolic
+peri_jk <- read_excel(here::here("data", "Perifusion+GSIS", "2024-04-06_Jelena_all_perifusion_AUCs.xlsx")) %>%
+  dplyr::mutate(PerifusionParam = str_c("JK", PerifusionParam, sep = "_"),
+                .keep = "unused") %>%
+  dplyr::mutate(across(4:ncol(.), as.numeric))
+
+# Separate data based on perifusion type (glucose, leucine, oleate-pamlitate)
+glu_peri_jk <- peri_jk %>%
+  dplyr::filter(Secretagogue == "GLU") %>%
+  remove_empty("cols")
+
+leu_peri_jk <- peri_jk %>%
+  dplyr::filter(Secretagogue == "LEU") %>%
+  remove_empty("cols")
+
+fa_peri_jk <- peri_jk %>%
+  dplyr::filter(Secretagogue == "OLE-PALM") %>%
+  remove_empty("cols")
+
+# Transpose for matrices
+glu_peri_jk_t <- glu_peri_jk %>%
+  dplyr::select(-c(MainOutcome, Secretagogue)) %>%
+  t() %>%
+  as.data.frame() %>%
+  set_names(.[1, ]) %>%
+  dplyr::slice_tail(., n = (nrow(.) - 1)) %>%
+  dplyr::mutate(Donor = rownames(.), .keep = c("unused")) %>%
+  dplyr::mutate(Donor = str_remove(Donor, pattern = "Donor"), across(where(is.character), str_squish)) %>%
+  dplyr::relocate(Donor) %>%
+  dplyr::filter(Donor %in% axys_donors$Id) %>%
+  dplyr::mutate(across(2:ncol(.), as.numeric))
+
+leu_peri_jk_t <- leu_peri_jk %>%
+  dplyr::select(-c(MainOutcome, Secretagogue)) %>%
+  t() %>%
+  as.data.frame() %>%
+  set_names(.[1, ]) %>%
+  dplyr::slice_tail(., n = (nrow(.) - 1)) %>%
+  dplyr::mutate(Donor = rownames(.), .keep = c("unused")) %>%
+  dplyr::mutate(Donor = str_remove(Donor, pattern = "Donor"), across(where(is.character), str_squish)) %>%
+  dplyr::relocate(Donor) %>%
+  dplyr::filter(Donor %in% axys_donors$Id) %>%
+  dplyr::mutate(across(2:ncol(.), as.numeric))
+
+fa_peri_jk_t <- fa_peri_jk %>%
+  dplyr::select(-c(MainOutcome, Secretagogue)) %>%
+  t() %>%
+  as.data.frame() %>%
+  set_names(.[1, ]) %>%
+  dplyr::slice_tail(., n = (nrow(.) - 1)) %>%
+  dplyr::mutate(Donor = rownames(.), .keep = c("unused")) %>%
+  dplyr::mutate(Donor = str_remove(Donor, pattern = "Donor"), across(where(is.character), str_squish)) %>%
+  dplyr::relocate(Donor) %>%
+  dplyr::filter(Donor %in% axys_donors$Id) %>%
+  dplyr::mutate(across(2:ncol(.), as.numeric))
+```
+
+```{r}
+# Load Myriam perifusion data
+glu_peri_mh <- read_excel(here::here("data", "Perifusion+GSIS", "2024-01-25_Perifusion_FINAL DATA_For analysis_AC.xlsx")) %>%
+  mutate(PerifusionParam = str_c("MH", PerifusionParam, sep = "_"),
+         .keep = c("unused")) %>% 
+  dplyr::mutate(across(3:ncol(.), as.numeric))
+
+glu_peri_mh_t <- glu_peri_mh %>%
+  dplyr::select(-MainOutcome) %>%
+  t() %>%
+  as.data.frame() %>%
+  set_names(.[1, ]) %>%
+  dplyr::slice_tail(., n = (nrow(.)-1)) %>%
+  dplyr::mutate(Donor = rownames(.),
+         .keep = c("unused")) %>%
+  dplyr::mutate(Donor = str_remove(Donor, pattern = "Donor"),
+         across(where(is.character), str_squish)) %>%
+  dplyr::relocate(Donor) %>%
+  dplyr::filter(Donor %in% axys_donors$Id) %>%
+  # dplyr::filter(!(Donor %in% c("R419", "R421"))) %>%
+  dplyr::mutate(across(2:ncol(.), as.numeric))
+```
+
+```{r}
+# Create a dataframe with all functional parameters
+func_list <- list(gsis_adi, glu_peri_mh_t, glu_peri_jk_t, leu_peri_jk_t, fa_peri_jk_t)
+func_param <- reduce(func_list, left_join, by = "Donor")
+```
+
+## Assess missingness in functional parameter data
+
+```{r, fig.width = 14, fig.height = 12, dpi = 100}
+library(naniar)
+
+naniar::gg_miss_var(func_param)  # % missing per variable
+naniar::vis_miss(func_param)
+```
+
+```{r, fig.width = 10, fig.height = 18, dpi = 100}
+library(DataExplorer)
+
+# Simple bar plot
+DataExplorer::plot_missing(func_param)
+
+# DataExplorer::create_report(func_param)
+```
+
+# Add metadata
+
+```{r}
+# Combine axys data with metadata
+axys_pops_meta_panc <- axys_pops_panc %>%
+  left_join(., axys_metadata2, by = c("DONOR" = "Id"))
+
+axys_pops_meta_adip <- axys_pops_adip %>%
+  left_join(., axys_metadata2, by = c("DONOR" = "Id"))
+
+# Combine functional parameter data with metadata
+func_param_meta <- axys_metadata2 %>%
+  left_join(., func_param, by = c("Id" = "Donor")) %>%
+  dplyr::mutate(Donor = Id, .keep = c("unused")) %>%
+  dplyr::relocate(Donor)
+
+gsis_adi_meta <- axys_metadata2 %>%
+  left_join(., gsis_adi, by = c("Id" = "Donor")) %>%
+  dplyr::mutate(Donor = Id, .keep = c("unused")) %>%
+  dplyr::relocate(Donor)
+
+glu_peri_jk_meta <- glu_peri_jk_t %>%
+  left_join(., axys_metadata2, by = c("Donor" = "Id")) %>%
+  dplyr::filter(!is.na(Sex)) %>%
+  dplyr::relocate(Donor)
+
+leu_peri_jk_meta <- leu_peri_jk_t %>%
+  left_join(., axys_metadata2, by = c("Donor" = "Id")) %>%
+  dplyr::filter(!is.na(Sex)) %>%
+  dplyr::relocate(Donor)
+
+fa_peri_jk_meta <- fa_peri_jk_t %>%
+  left_join(., axys_metadata2, by = c("Donor" = "Id")) %>%
+  dplyr::filter(!is.na(Sex)) %>%
+  dplyr::relocate(Donor)
+
+glu_peri_mh_meta <- glu_peri_mh_t %>%
+  left_join(., axys_metadata2, by = c("Donor" = "Id")) %>%
+  # dplyr::filter(!(Donor %in% c("R419", "R421"))) %>%
+  dplyr::mutate(across(starts_with("MH_"), as.numeric)) %>%
+  dplyr::relocate(Donor)
+```
+
+# PCA analyses
+
+I used pcaMethods to perform PCA while having NA values.
+
+```{r}
+# Perform PCA using the NIPALS algorithm
+pops_panc_pca   <- pcaMethods::pca(axys_pops_panc, method = "nipals", nPcs = 3, scale = "uv", center = TRUE)
+pops_adip_pca   <- pcaMethods::pca(axys_pops_adip, method = "nipals", nPcs = 3, scale = "uv", center = TRUE)
+func_pca        <- pcaMethods::pca(func_param, method = "nipals", nPcs = 3, scale = "uv", center = TRUE)
+gsis_adi_pca    <- pcaMethods::pca(gsis_adi, method = "nipals", nPcs = 3, scale = "uv", center = TRUE)
+glu_peri_jk_pca <- pcaMethods::pca(glu_peri_jk_t, method = "nipals", nPcs = 3, scale = "uv", center = TRUE)
+leu_peri_jk_pca <- pcaMethods::pca(leu_peri_jk_t, method = "nipals", nPcs = 3, scale = "uv", center = TRUE)
+fa_peri_jk_pca  <- pcaMethods::pca(fa_peri_jk_t, method = "nipals", nPcs = 3, scale = "uv", center = TRUE)
+glu_peri_mh_pca <- pcaMethods::pca(glu_peri_mh_t, method = "nipals", nPcs = 3, scale = "uv", center = TRUE)
+```
+
+```{r, fig.width = 12}
+# View the summary of the PCA results
+summary(pops_panc_pca)
+summary(pops_adip_pca)
+summary(func_pca)
+summary(gsis_adi_pca)
+summary(glu_peri_jk_pca)
+summary(leu_peri_jk_pca)
+summary(fa_peri_jk_pca)
+summary(glu_peri_mh_pca)
+```
+
+## Biplots
+
+```{r, fig.width = 8, fig.height = 8, dpi = 100}
+# Visualize biplots
+biplot(pops_panc_pca, cex = 0.7, main = "Pancreas Analytes")
+biplot(pops_adip_pca, cex = 0.7, main = "Adipose Analytes")
+biplot(func_pca, cex = 0.7, main = "All Functional Parameters")
+biplot(gsis_adi_pca, cex = 0.7, main = "Static GSIS")
+biplot(glu_peri_jk_pca, cex = 0.7, main = "Glucose Perifusion (JK)")
+biplot(leu_peri_jk_pca, cex = 0.7, main = "Leucine Perifusion (JK)")
+biplot(fa_peri_jk_pca, cex = 0.7, main = "Fatty Acid Perifusion (JK)")
+biplot(glu_peri_mh_pca, cex = 0.7, main = "Glucose Perifusion (MH)")
+```
+
+## PCA plots
+
+```{r}
+# Extract the scores (principal components)
+pops_panc_pca_scores   <- scores(pops_panc_pca)
+pops_adip_pca_scores   <- scores(pops_adip_pca)
+func_pca_scores        <- scores(func_pca)
+gsis_adi_pca_scores    <- scores(gsis_adi_pca)
+glu_peri_jk_pca_scores <- scores(glu_peri_jk_pca)
+leu_peri_jk_pca_scores <- scores(leu_peri_jk_pca)
+fa_peri_jk_pca_scores  <- scores(fa_peri_jk_pca)
+glu_peri_mh_pca_scores <- scores(glu_peri_mh_pca)
+```
+
+```{r}
+# Extract the loadings
+pops_panc_pca_loadings   <- loadings(pops_panc_pca)
+pops_adip_pca_loadings   <- loadings(pops_adip_pca)
+func_pca_loadings        <- loadings(func_pca)
+gsis_adi_pca_loadings    <- loadings(gsis_adi_pca)
+glu_peri_jk_pca_loadings <- loadings(glu_peri_jk_pca)
+leu_peri_jk_pca_loadings <- loadings(leu_peri_jk_pca)
+fa_peri_jk_pca_loadings  <- loadings(fa_peri_jk_pca)
+glu_peri_mh_pca_loadings <- loadings(glu_peri_mh_pca)
+```
+
+```{r}
+# Covert loadings to a dataframe
+panc_loadings_df <- as.data.frame(pops_panc_pca_loadings) %>%
+  dplyr::mutate(Variable = rownames(pops_panc_pca_loadings)) %>%
+  pivot_longer(cols = -Variable, names_to = "PC", values_to = "Loading")
+
+adip_loadings_df <- as.data.frame(pops_adip_pca_loadings) %>%
+  dplyr::mutate(Variable = rownames(pops_adip_pca_loadings)) %>%
+  pivot_longer(cols = -Variable, names_to = "PC", values_to = "Loading")
+
+func_loadings_df <- as.data.frame(func_pca_loadings) %>%
+  dplyr::mutate(Variable = rownames(func_pca_loadings)) %>%
+  pivot_longer(cols = -Variable, names_to = "PC", values_to = "Loading")
+
+gsis_adi_loadings_df <- as.data.frame(gsis_adi_pca_loadings) %>%
+  dplyr::mutate(Variable = rownames(gsis_adi_pca_loadings)) %>%
+  pivot_longer(cols = -Variable, names_to = "PC", values_to = "Loading")
+
+glu_peri_jk_loadings_df <- as.data.frame(glu_peri_jk_pca_loadings) %>%
+  dplyr::mutate(Variable = rownames(glu_peri_jk_pca_loadings)) %>%
+  pivot_longer(cols = -Variable, names_to = "PC", values_to = "Loading")
+
+leu_peri_jk_loadings_df <- as.data.frame(leu_peri_jk_pca_loadings) %>%
+  dplyr::mutate(Variable = rownames(leu_peri_jk_pca_loadings)) %>%
+  pivot_longer(cols = -Variable, names_to = "PC", values_to = "Loading")
+
+fa_peri_jk_loadings_df <- as.data.frame(fa_peri_jk_pca_loadings) %>%
+  dplyr::mutate(Variable = rownames(fa_peri_jk_pca_loadings)) %>%
+  pivot_longer(cols = -Variable, names_to = "PC", values_to = "Loading")
+
+glu_peri_mh_loadings_df <- as.data.frame(glu_peri_mh_pca_loadings) %>%
+  dplyr::mutate(Variable = rownames(glu_peri_mh_pca_loadings)) %>%
+  pivot_longer(cols = -Variable, names_to = "PC", values_to = "Loading")
+```
+
+```{r}
+# Extract the R^2 values for the variance explained
+explained_variance_panc        <- pops_panc_pca@R2
+explained_variance_adip        <- pops_adip_pca@R2
+explained_variance_func        <- func_pca@R2
+explained_variance_gsis_adi    <- gsis_adi_pca@R2
+explained_variance_glu_peri_jk <- glu_peri_jk_pca@R2
+explained_variance_leu_peri_jk <- leu_peri_jk_pca@R2
+explained_variance_fa_peri_jk  <- fa_peri_jk_pca@R2
+explained_variance_glu_peri_mh <- glu_peri_mh_pca@R2
+
+# Cumulative R^2
+cumulative_variance_panc        <- cumsum(explained_variance_panc)
+cumulative_variance_adip        <- cumsum(explained_variance_adip)
+cumulative_variance_func        <- cumsum(explained_variance_func)
+cumulative_variance_gsis_adi    <- cumsum(explained_variance_gsis_adi)
+cumulative_variance_glu_peri_jk <- cumsum(explained_variance_glu_peri_jk)
+cumulative_variance_leu_peri_jk <- cumsum(explained_variance_leu_peri_jk)
+cumulative_variance_fa_peri_jk  <- cumsum(explained_variance_fa_peri_jk)
+cumulative_variance_glu_peri_mh <- cumsum(explained_variance_glu_peri_mh)
+
+# Extract variance explained for PC1 and PC2 (for plotting)
+pc1_variance_panc <- round(explained_variance_panc[1] * 100, 2)
+pc2_variance_panc <- round(explained_variance_panc[2] * 100, 2)
+
+pc1_variance_adip <- round(explained_variance_adip[1] * 100, 2)
+pc2_variance_adip <- round(explained_variance_adip[2] * 100, 2)
+
+pc1_variance_func <- round(explained_variance_func[1] * 100, 2)
+pc2_variance_func <- round(explained_variance_func[2] * 100, 2)
+
+pc1_variance_gsis_adi <- round(explained_variance_gsis_adi[1] * 100, 2)
+pc2_variance_gsis_adi <- round(explained_variance_gsis_adi[2] * 100, 2)
+
+pc1_variance_glu_peri_jk <- round(explained_variance_glu_peri_jk[1] * 100, 2)
+pc2_variance_glu_peri_jk <- round(explained_variance_glu_peri_jk[2] * 100, 2)
+
+pc1_variance_leu_peri_jk <- round(explained_variance_leu_peri_jk[1] * 100, 2)
+pc2_variance_leu_peri_jk <- round(explained_variance_leu_peri_jk[2] * 100, 2)
+
+pc1_variance_fa_peri_jk <- round(explained_variance_fa_peri_jk[1] * 100, 2)
+pc2_variance_fa_peri_jk <- round(explained_variance_fa_peri_jk[2] * 100, 2)
+
+pc1_variance_glu_peri_mh <- round(explained_variance_glu_peri_mh[1] * 100, 2)
+pc2_variance_glu_peri_mh <- round(explained_variance_glu_peri_mh[2] * 100, 2)
+```
+
+```{r}
+# Build PCA dataframes for plotting
+pops_panc_pca_data   <- make_pca_df(pops_panc_pca_scores, axys_pops_meta_panc, donor_col = "DONOR")
+pops_adip_pca_data   <- make_pca_df(pops_adip_pca_scores, axys_pops_meta_adip, donor_col = "DONOR")
+func_pca_data        <- make_pca_df(func_pca_scores, func_param_meta)
+gsis_adi_pca_data    <- make_pca_df(gsis_adi_pca_scores, gsis_adi_meta)
+glu_peri_jk_pca_data <- make_pca_df(glu_peri_jk_pca_scores, glu_peri_jk_meta)
+leu_peri_jk_pca_data <- make_pca_df(leu_peri_jk_pca_scores, leu_peri_jk_meta)
+fa_peri_jk_pca_data  <- make_pca_df(fa_peri_jk_pca_scores, fa_peri_jk_meta)
+glu_peri_mh_pca_data <- make_pca_df(glu_peri_mh_pca_scores, glu_peri_mh_meta)
+```
+
+### Pancreas analytes
+
+```{r, fig.width = 10, dpi = 100}
+plot_pca_scores(
+  data = pops_panc_pca_data,
+  group_var = NULL,
+  title = "Pancreas Analytes PCA Score Plot (NIPALS)",
+  pc1_var = pc1_variance_panc,
+  pc2_var = pc2_variance_panc,
+  nudge_y = 0.2
+)
+
+# png(filename = "2025-08-27_panc_PCA_by_bmi.png", width = 8, height = 6, units = "in", res = 600)
+plot_pca_scores(
+  data = pops_panc_pca_data,
+  group_var = "BMI",
+  title = "Pancreas Analytes PCA Score Plot (NIPALS)",
+  pc1_var = pc1_variance_panc,
+  pc2_var = pc2_variance_panc,
+  nudge_y = 0.2
+)
+# dev.off()
+
+# png(filename = "2025-08-27_panc_PCA_by_sex.png", width = 8, height = 6, units = "in", res = 600)
+plot_pca_scores(
+  data = pops_panc_pca_data,
+  group_var = "Sex",
+  title = "Pancreas Analytes PCA Score Plot (NIPALS)",
+  pc1_var = pc1_variance_panc,
+  pc2_var = pc2_variance_panc,
+  nudge_y = 0.2
+)
+# dev.off()
+```
+
+```{r, fig.width = 8, fig.height = 6, dpi = 100}
+# Plot loadings
+ggplot(filter(panc_loadings_df, PC == "PC1"), aes(x = reorder(Variable, Loading), y = Loading)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(title = "Pancreas Analytes: Loadings on PC1", x = "Variable", y = "Loading") +
+  theme_minimal()
+
+ggplot(filter(panc_loadings_df, PC == "PC2"), aes(x = reorder(Variable, Loading), y = Loading)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(title = "Pancreas Analytes: Loadings on PC2", x = "Variable", y = "Loading") +
+  theme_minimal()
+```
+
+```{r, fig.width = 12, fig.height = 10, dpi = 100}
+# Plot biplot
+plot_biplot_pm(
+  pca_obj = pops_panc_pca,
+  metadata = axys_pops_meta_panc,
+  donor_col = NULL,
+  group_col = NULL,
+  pc_x = 1,
+  pc_y = 2,
+  explained_var = pops_panc_pca@R2,
+  ellipse = TRUE,
+  
+  arrow_label_size = 4,
+  arrow_label_color = "grey30",
+  arrow_color = "gray50",
+  arrow_label_nudge_x = .3,
+  arrow_label_nudge_y = .3,
+  
+  point_size = 2.5,
+  dot_label_size = 3.5,
+  point_colors = "steelblue",
+  alpha = 0.6,
+  title = "Pancreas Analytes PCA Biplot (NIPALS)"
+)
+```
+
+### Adipose analytes
+
+```{r, fig.width = 10, dpi = 100}
+plot_pca_scores(
+  data = pops_adip_pca_data,
+  group_var = NULL,
+  title = "Adipose Analytes PCA Score Plot (NIPALS)",
+  pc1_var = pc1_variance_adip,
+  pc2_var = pc2_variance_adip,
+  nudge_y = 0.2
+)
+
+# png(filename = "2025-08-27_adip_PCA_by_bmi.png", width = 8, height = 6, units = "in", res = 600)
+plot_pca_scores(
+  data = pops_adip_pca_data,
+  group_var = "BMI",
+  title = "Adipose Analytes PCA Score Plot (NIPALS)",
+  pc1_var = pc1_variance_adip,
+  pc2_var = pc2_variance_adip,
+  nudge_y = 0.2
+)
+# dev.off()
+
+# png(filename = "2025-08-27_adip_PCA_by_sex.png", width = 8, height = 6, units = "in", res = 600)
+plot_pca_scores(
+  data = pops_adip_pca_data,
+  group_var = "Sex",
+  title = "Adipose Analytes PCA Score Plot (NIPALS)",
+  pc1_var = pc1_variance_adip,
+  pc2_var = pc2_variance_adip,
+  nudge_y = 0.2
+)
+# dev.off()
+```
+
+```{r, fig.width = 8, fig.height = 7, dpi = 100}
+# Plot loadings
+ggplot(filter(adip_loadings_df, PC == "PC1"), aes(x = reorder(Variable, Loading), y = Loading)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(title = "Adipose Analytes: Loadings on PC1", x = "Variable", y = "Loading") +
+  theme_minimal()
+
+ggplot(filter(adip_loadings_df, PC == "PC2"), aes(x = reorder(Variable, Loading), y = Loading)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(title = "Adipose Analytes: Loadings on PC2", x = "Variable", y = "Loading") +
+  theme_minimal()
+```
+
+```{r, fig.width = 12, fig.height = 10, dpi = 100}
+# Plot biplot
+plot_biplot_pm(
+  pca_obj = pops_adip_pca,
+  metadata = axys_pops_meta_adip,
+  donor_col = NULL,
+  group_col = NULL,
+  pc_x = 1,
+  pc_y = 2,
+  explained_var = pops_adip_pca@R2,
+  ellipse = TRUE,
+  
+  arrow_label_size = 4,
+  arrow_label_color = "grey30",
+  arrow_color = "gray50",
+  arrow_label_nudge_x = .3,
+  arrow_label_nudge_y = .3,
+  
+  point_size = 2.5,
+  dot_label_size = 3.5,
+  point_colors = "steelblue",
+  alpha = 0.6,
+  title = "Adipose Analytes PCA Biplot (NIPALS)"
+)
+```
+
+### All functional parameters
+
+```{r, fig.width = 10, dpi = 100}
+plot_pca_scores(
+  data = func_pca_data,
+  group_var = NULL,
+  title = "All Functional Parameters Score Plot (NIPALS)",
+  pc1_var = pc1_variance_func,
+  pc2_var = pc2_variance_func
+)
+
+plot_pca_scores(
+  data = func_pca_data,
+  group_var = "BMI",
+  title = "All Functional Parameters Score Plot (NIPALS)",
+  pc1_var = pc1_variance_func,
+  pc2_var = pc2_variance_func
+)
+
+plot_pca_scores(
+  data = func_pca_data,
+  group_var = "Sex",
+  title = "All Functional Parameters Score Plot (NIPALS)",
+  pc1_var = pc1_variance_func,
+  pc2_var = pc2_variance_func
+)
+```
+
+```{r, fig.width = 10, fig.height = 14, dpi = 100}
+# Plot loadings
+ggplot(filter(func_loadings_df, PC == "PC1"), aes(x = reorder(Variable, Loading), y = Loading)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(title = "All Functional Parameters: Loadings on PC1", x = "Variable", y = "Loading") +
+  theme_minimal()
+
+ggplot(filter(func_loadings_df, PC == "PC2"), aes(x = reorder(Variable, Loading), y = Loading)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(title = "All Functional Parameters: Loadings on PC2", x = "Variable", y = "Loading") +
+  theme_minimal()
+```
+
+```{r, fig.width = 12, fig.height = 10, dpi = 100}
+# Plot biplot
+plot_biplot_pm(
+  pca_obj = func_pca,
+  metadata = func_param_meta,
+  donor_col = NULL,
+  group_col = NULL,
+  pc_x = 1,
+  pc_y = 2,
+  explained_var = func_pca@R2,
+  ellipse = TRUE,
+  
+  arrow_label_size = 4,
+  arrow_label_color = "grey30",
+  arrow_color = "gray50",
+  arrow_label_nudge_x = .3,
+  arrow_label_nudge_y = .3,
+  
+  point_size = 2.5,
+  dot_label_size = 3.5,
+  point_colors = "steelblue",
+  alpha = 0.6,
+  title = "All Functional Parameters PCA Biplot (NIPALS)"
+)
+```
+
+### Static GSIS
+
+```{r, fig.width = 10, dpi = 100}
+plot_pca_scores(
+  data = gsis_adi_pca_data,
+  group_var = NULL,
+  title = "Static GSIS PCA Score Plot (NIPALS)",
+  pc1_var = pc1_variance_gsis_adi,
+  pc2_var = pc2_variance_gsis_adi,
+  nudge_y = 0.2
+)
+
+plot_pca_scores(
+  data = gsis_adi_pca_data,
+  group_var = "BMI",
+  title = "Static GSIS PCA Score Plot (NIPALS)",
+  pc1_var = pc1_variance_gsis_adi,
+  pc2_var = pc2_variance_gsis_adi,
+  nudge_y = 0.2
+)
+
+plot_pca_scores(
+  data = gsis_adi_pca_data,
+  group_var = "Sex",
+  title = "Static GSIS PCA Score Plot (NIPALS)",
+  pc1_var = pc1_variance_gsis_adi,
+  pc2_var = pc2_variance_gsis_adi,
+  nudge_y = 0.2
+)
+```
+
+```{r, fig.width = 8, fig.height = 4, dpi = 100}
+# Plot loadings
+ggplot(filter(gsis_adi_loadings_df, PC == "PC1"), aes(x = reorder(Variable, Loading), y = Loading)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(title = "Static GSIS: Loadings on PC1", x = "Variable", y = "Loading") +
+  theme_minimal()
+
+ggplot(filter(gsis_adi_loadings_df, PC == "PC2"), aes(x = reorder(Variable, Loading), y = Loading)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(title = "Static GSIS: Loadings on PC2", x = "Variable", y = "Loading") +
+  theme_minimal()
+```
+
+```{r, fig.width = 12, fig.height = 10, dpi = 100}
+# Plot biplot
+plot_biplot_pm(
+  pca_obj = gsis_adi_pca,
+  metadata = gsis_adi_meta,
+  donor_col = NULL,
+  group_col = NULL,
+  pc_x = 1,
+  pc_y = 2,
+  explained_var = gsis_adi_pca@R2,
+  ellipse = TRUE,
+  
+  arrow_label_size = 4,
+  arrow_label_color = "grey30",
+  arrow_color = "gray50",
+  arrow_label_nudge_x = .3,
+  arrow_label_nudge_y = .3,
+  
+  point_size = 2.5,
+  dot_label_size = 3.5,
+  point_colors = "steelblue",
+  alpha = 0.6,
+  title = "Static GSIS PCA Biplot (NIPALS)"
+)
+```
+
+### JK Glucose Perifusion
+
+```{r, fig.width = 10, dpi = 100}
+plot_pca_scores(
+  data = glu_peri_jk_pca_data,
+  group_var = NULL,
+  title = "Glucose perifusion (JK) PCA Score Plot (NIPALS)",
+  pc1_var = pc1_variance_glu_peri_jk,
+  pc2_var = pc2_variance_glu_peri_jk
+)
+
+plot_pca_scores(
+  data = glu_peri_jk_pca_data,
+  group_var = "BMI",
+  title = "Glucose perifusion (JK) PCA Score Plot (NIPALS)",
+  pc1_var = pc1_variance_glu_peri_jk,
+  pc2_var = pc2_variance_glu_peri_jk
+)
+
+plot_pca_scores(
+  data = glu_peri_jk_pca_data,
+  group_var = "Sex",
+  title = "Glucose perifusion (JK) PCA Score Plot (NIPALS)",
+  pc1_var = pc1_variance_glu_peri_jk,
+  pc2_var = pc2_variance_glu_peri_jk
+)
+```
+
+```{r, fig.width = 8, fig.height = 5, dpi = 100}
+# Plot loadings
+ggplot(filter(glu_peri_jk_loadings_df, PC == "PC1"), aes(x = reorder(Variable, Loading), y = Loading)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(title = "JK Glucose Perifusion: Loadings on PC1", x = "Variable", y = "Loading") +
+  theme_minimal()
+
+ggplot(filter(glu_peri_jk_loadings_df, PC == "PC2"), aes(x = reorder(Variable, Loading), y = Loading)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(title = "JK Glucose Perifusion: Loadings on PC2", x = "Variable", y = "Loading") +
+  theme_minimal()
+```
+
+```{r, fig.width = 12, fig.height = 10, dpi = 100}
+# Plot biplot
+plot_biplot_pm(
+  pca_obj = glu_peri_jk_pca,
+  metadata = glu_peri_jk_meta,
+  donor_col = NULL,
+  group_col = NULL,
+  pc_x = 1,
+  pc_y = 2,
+  explained_var = glu_peri_jk_pca@R2,
+  ellipse = TRUE,
+  
+  arrow_label_size = 4,
+  arrow_label_color = "grey30",
+  arrow_color = "gray50",
+  arrow_label_nudge_x = .3,
+  arrow_label_nudge_y = .3,
+  
+  point_size = 2.5,
+  dot_label_size = 3.5,
+  point_colors = "steelblue",
+  alpha = 0.6,
+  title = "JK Glucose Perifusion PCA Biplot (NIPALS)"
+)
+```
+
+### JK Leucine Perifusion
+
+```{r, fig.width = 10, dpi = 100}
+plot_pca_scores(
+  data = leu_peri_jk_pca_data,
+  group_var = NULL,
+  title = "Leucine perifusion (JK) PCA Score Plot (NIPALS)",
+  pc1_var = pc1_variance_leu_peri_jk,
+  pc2_var = pc2_variance_leu_peri_jk,
+  nudge_y = 0.2
+)
+
+plot_pca_scores(
+  data = leu_peri_jk_pca_data,
+  group_var = "BMI",
+  title = "Leucine perifusion (JK) PCA Score Plot (NIPALS)",
+  pc1_var = pc1_variance_leu_peri_jk,
+  pc2_var = pc2_variance_leu_peri_jk,
+  nudge_y = 0.2
+)
+
+plot_pca_scores(
+  data = leu_peri_jk_pca_data,
+  group_var = "Sex",
+  title = "Leucine perifusion (JK) PCA Score Plot (NIPALS)",
+  pc1_var = pc1_variance_leu_peri_jk,
+  pc2_var = pc2_variance_leu_peri_jk,
+  nudge_y = 0.2
+)
+```
+
+```{r, fig.width = 8, fig.height = 4, dpi = 100}
+# Plot loadings
+ggplot(filter(leu_peri_jk_loadings_df, PC == "PC1"), aes(x = reorder(Variable, Loading), y = Loading)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(title = "JK Leucine Perifusion: Loadings on PC1", x = "Variable", y = "Loading") +
+  theme_minimal()
+
+ggplot(filter(leu_peri_jk_loadings_df, PC == "PC2"), aes(x = reorder(Variable, Loading), y = Loading)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(title = "JK Leucine Perifusion: Loadings on PC2", x = "Variable", y = "Loading") +
+  theme_minimal()
+```
+
+```{r, fig.width = 12, fig.height = 10, dpi = 100}
+# Plot biplot
+plot_biplot_pm(
+  pca_obj = leu_peri_jk_pca,
+  metadata = leu_peri_jk_meta,
+  donor_col = NULL,
+  group_col = NULL,
+  pc_x = 1,
+  pc_y = 2,
+  explained_var = leu_peri_jk_pca@R2,
+  ellipse = TRUE,
+  
+  arrow_label_size = 4,
+  arrow_label_color = "grey30",
+  arrow_color = "gray50",
+  arrow_label_nudge_x = .3,
+  arrow_label_nudge_y = .3,
+  
+  point_size = 2.5,
+  dot_label_size = 3.5,
+  point_colors = "steelblue",
+  alpha = 0.6,
+  title = "JK Leucine Perifusion PCA Biplot (NIPALS)"
+)
+```
+
+### JK Fatty Acid Perifusion
+
+```{r, fig.width = 10, dpi = 100}
+plot_pca_scores(
+  data = fa_peri_jk_pca_data,
+  group_var = NULL,
+  title = "Fatty Acid Perifusion (JK) PCA Score Plot (NIPALS)",
+  pc1_var = pc1_variance_fa_peri_jk,
+  pc2_var = pc2_variance_fa_peri_jk,
+  nudge_y = 0.2
+)
+
+plot_pca_scores(
+  data = fa_peri_jk_pca_data,
+  group_var = "BMI",
+  title = "Fatty Acid Perifusion (JK) PCA Score Plot (NIPALS)",
+  pc1_var = pc1_variance_fa_peri_jk,
+  pc2_var = pc2_variance_fa_peri_jk,
+  nudge_y = 0.2
+)
+
+plot_pca_scores(
+  data = fa_peri_jk_pca_data,
+  group_var = "Sex",
+  title = "Fatty Acid Perifusion (JK) PCA Score Plot (NIPALS)",
+  pc1_var = pc1_variance_fa_peri_jk,
+  pc2_var = pc2_variance_fa_peri_jk,
+  nudge_y = 0.2
+)
+```
+
+```{r, fig.width = 8, fig.height = 4, dpi = 100}
+# Plot loadings
+ggplot(filter(fa_peri_jk_loadings_df, PC == "PC1"), aes(x = reorder(Variable, Loading), y = Loading)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(title = "JK Fatty Acid Perifusion: Loadings on PC1", x = "Variable", y = "Loading") +
+  theme_minimal()
+
+ggplot(filter(fa_peri_jk_loadings_df, PC == "PC2"), aes(x = reorder(Variable, Loading), y = Loading)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(title = "JK Fatty Acid Perifusion: Loadings on PC2", x = "Variable", y = "Loading") +
+  theme_minimal()
+```
+
+```{r, fig.width = 12, fig.height = 10, dpi = 100}
+# Plot biplot
+plot_biplot_pm(
+  pca_obj = fa_peri_jk_pca,
+  metadata = fa_peri_jk_meta,
+  donor_col = NULL,
+  group_col = NULL,
+  pc_x = 1,
+  pc_y = 2,
+  explained_var = fa_peri_jk_pca@R2,
+  ellipse = TRUE,
+  
+  arrow_label_size = 4,
+  arrow_label_color = "grey30",
+  arrow_color = "gray50",
+  arrow_label_nudge_x = .3,
+  arrow_label_nudge_y = .3,
+  
+  point_size = 2.5,
+  dot_label_size = 3.5,
+  point_colors = "steelblue",
+  alpha = 0.6,
+  title = "JK Fatty Acid Perifusion PCA Biplot (NIPALS)"
+)
+```
+
+### MH Glucose Perifusion
+
+```{r, fig.width = 10, dpi = 100}
+plot_pca_scores(
+  data = glu_peri_mh_pca_data,
+  group_var = NULL,
+  title = "Glucose Perifusion (MH) PCA Score Plot (NIPALS)",
+  pc1_var = pc1_variance_glu_peri_mh,
+  pc2_var = pc2_variance_glu_peri_mh,
+  nudge_y = 0.2
+)
+
+plot_pca_scores(
+  data = glu_peri_mh_pca_data,
+  group_var = "BMI",
+  title = "Glucose Perifusion (MH) PCA Score Plot (NIPALS)",
+  pc1_var = pc1_variance_glu_peri_mh,
+  pc2_var = pc2_variance_glu_peri_mh,
+  nudge_y = 0.2
+)
+
+plot_pca_scores(
+  data = glu_peri_mh_pca_data,
+  group_var = "Sex",
+  title = "Glucose Perifusion (MH) PCA Score Plot (NIPALS)",
+  pc1_var = pc1_variance_glu_peri_mh,
+  pc2_var = pc2_variance_glu_peri_mh,
+  nudge_y = 0.2
+)
+```
+
+```{r, fig.width = 8, fig.height = 4, dpi = 100}
+# Plot loadings
+ggplot(filter(glu_peri_mh_loadings_df, PC == "PC1"), aes(x = reorder(Variable, Loading), y = Loading)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(title = "MH Glucose Perifusion: Loadings on PC1", x = "Variable", y = "Loading") +
+  theme_minimal()
+
+ggplot(filter(glu_peri_mh_loadings_df, PC == "PC2"), aes(x = reorder(Variable, Loading), y = Loading)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(title = "MH Glucose Perifusion: Loadings on PC2", x = "Variable", y = "Loading") +
+  theme_minimal()
+```
+
+```{r, fig.width = 12, fig.height = 10, dpi = 100}
+# Plot biplot
+plot_biplot_pm(
+  pca_obj = glu_peri_mh_pca,
+  metadata = glu_peri_mh_meta,
+  donor_col = NULL,
+  group_col = NULL,
+  pc_x = 1,
+  pc_y = 2,
+  explained_var = glu_peri_mh_pca@R2,
+  ellipse = TRUE,
+  
+  arrow_label_size = 4,
+  arrow_label_color = "grey30",
+  arrow_color = "gray50",
+  arrow_label_nudge_x = .3,
+  arrow_label_nudge_y = .3,
+  
+  point_size = 2.5,
+  dot_label_size = 3.5,
+  point_colors = "steelblue",
+  alpha = 0.6,
+  title = "MH Glucose Perifusion PCA Biplot (NIPALS)"
+)
+```
+
+# Session Info
+
+```{r}
+sessionInfo()
+```
