@@ -1,0 +1,594 @@
+---
+title: "Quantifying inter-lab variability of GSIS outcomes"
+author: "Angela Ching"
+date: "`r Sys.Date()`"
+output: 
+  html_notebook:
+    toc: yes
+---
+
+# Packages
+
+```{r packages}
+library(tidyverse)
+library(readxl)
+library(dplyr)
+library(tibble)
+library(lme4)
+library(psych)
+library(metafor)
+library(here)
+```
+
+# Helper functions
+
+```{r}
+source(here::here("functions", "inter_lab_variability_helpers.R"))
+```
+
+# Load data
+
+```{r}
+# load AXYS donor metadata
+axys_metadata <- read_csv(here("data", "2024-08-22_donor_characteristics_FINAL.csv"), show_col_types = FALSE) %>%
+  mutate(BMI_category = case_when(BMI < 24.9 ~ "Lean",
+                                  BMI >= 24.9 & BMI <= 29.9 ~ "Overweight",
+                                  BMI > 29.9 ~ "Obese"),
+         Hba1c_category = case_when(Hba1c < 6 ~ "Normoglycemic",
+                                    Hba1c <= 6.5 ~ "Prediabetic",
+                                    Hba1c > 6.5 ~ "Diabetic"),
+         BMI_category = factor(BMI_category, levels = c("Lean", "Overweight", "Obese")),
+         Hba1c_category = factor(Hba1c_category, levels = c("Normoglycemic", "Prediabetic", "Diabetic")),
+         Sex = as_factor(Sex),
+         Diabetes_status = as_factor(Diabetes_status)) %>%
+  dplyr::select(-Purity)
+
+# Donor IDs
+axys_donors <- axys_metadata %>%
+  dplyr::pull(Id)
+```
+
+```{r}
+# load GSIS data from ADI
+gsis_adi_param <- read_excel(here("data", "Perifusion+GSIS", "2024-05-18_IsletCore_GSIS_from_TeamGrant_website.xlsx")) %>%
+  mutate(Cond = factor(Cond, levels = c("1", "2", "3")),
+                replicate = as.character(replicate))
+
+gsis_adi_ave <- gsis_adi_param %>%
+  mutate(across(4:ncol(.), as.numeric)) %>%
+  group_by(Donor, Cond) %>%
+  dplyr::mutate(InsulinContent_IsletCore = mean(InsulinContent),
+                LG_IsletCore = mean(LG, na.rm = TRUE),
+                HG_IsletCore = mean(HG, na.rm = TRUE),
+                SI_IsletCore = mean(SI, na.rm = TRUE),
+                .keep = c("unused")) %>%
+  distinct(Donor, Cond, .keep_all = TRUE) %>%
+  dplyr::select(-replicate) %>%
+  ungroup()
+  
+gsis_adi_wide <- gsis_adi_ave %>%
+  pivot_wider(names_from = Cond, values_from = c(InsulinContent_IsletCore, LG_IsletCore, HG_IsletCore, SI_IsletCore)) %>%
+  relocate(Donor, InsulinContent_IsletCore_1, LG_IsletCore_1, HG_IsletCore_1, SI_IsletCore_1,
+           InsulinContent_IsletCore_2, LG_IsletCore_2, HG_IsletCore_2, SI_IsletCore_2,
+           InsulinContent_IsletCore_3, LG_IsletCore_3, HG_IsletCore_3, SI_IsletCore_3) %>%
+  dplyr::filter(Donor %in% axys_donors)
+```
+
+```{r}
+# Load Myriam perifusion data
+glu_peri_mh <- read_excel(here("data", "Perifusion+GSIS", "2024-01-25_Perifusion_FINAL DATA_For analysis_AC.xlsx")) %>%
+  mutate(PerifusionParam = str_c("MH", PerifusionParam, sep = "_"),
+         .keep = c("unused")) %>% 
+  mutate(across(3:ncol(.), as.numeric))
+
+glu_peri_mh_t <- glu_peri_mh %>%
+  dplyr::select(-MainOutcome) %>%
+  t() %>%
+  as.data.frame() %>%
+  set_names(.[1, ]) %>%
+  slice_tail(., n = (nrow(.)-1)) %>%
+  mutate(Donor = rownames(.),
+         .keep = c("unused")) %>%
+  mutate(Donor = str_remove(Donor, pattern = "Donor"),
+         across(where(is.character), str_squish)) %>%
+  relocate(Donor) %>%
+  dplyr::filter(!Donor %in% c("R419", "R421"))
+```
+
+```{r}
+# Keep columns to compare across labs
+mh_peri <- glu_peri_mh_t %>%
+  dplyr::select("Donor", "MH_LGauc", "MH_HGauc", "MH_HGauc_LGauc")
+
+adi_gsis <- gsis_adi_wide %>%
+  dplyr::select("Donor", "LG_IsletCore_1", "HG_IsletCore_1", "SI_IsletCore_1")
+```
+
+```{r}
+# Combined MH and ADI columns
+mh_adi <- mh_peri %>%
+  left_join(adi_gsis, by = c("Donor" = "Donor")) %>%
+  dplyr::rename(
+    Donor = Donor,
+    LG_AUC_Lab1 = MH_LGauc,
+    HG_AUC_Lab1 = MH_HGauc,
+    SI_Lab1     = MH_HGauc_LGauc,
+    LG_AUC_Lab2 = LG_IsletCore_1,
+    HG_AUC_Lab2 = HG_IsletCore_1,
+    SI_Lab2     = SI_IsletCore_1
+  ) %>%
+    dplyr::mutate(
+    LG_AUC_Lab1 = as.numeric(LG_AUC_Lab1),
+    HG_AUC_Lab1 = as.numeric(HG_AUC_Lab1),
+    SI_Lab1 = as.numeric(SI_Lab1)
+  )
+
+# Pivot combined dataframe to long format
+mh_adi_long <- mh_adi %>%
+  pivot_longer(
+    cols = -Donor,
+    names_to = c("Measure", "Lab"),
+    names_sep = "_Lab",
+    values_to = "value"
+  ) %>%
+  mutate(
+    Lab = paste0("Lab", Lab)
+  )
+
+# z-transform values in the wide-format dataframe
+mh_adi_std <- mh_adi %>%
+  mutate(
+    z_LG_AUC_Lab1 = scale(LG_AUC_Lab1)[,1],
+    z_LG_AUC_Lab2 = scale(LG_AUC_Lab2)[,1],
+    
+    z_HG_AUC_Lab1 = scale(HG_AUC_Lab1)[,1],
+    z_HG_AUC_Lab2 = scale(HG_AUC_Lab2)[,1],
+
+    z_SI_Lab1 = scale(SI_Lab1)[,1],
+    z_SI_Lab2 = scale(SI_Lab2)[,1]
+  )
+
+# z-transform values in the long-format dataframe
+mh_adi_long_std <- mh_adi_long %>%
+  group_by(Lab, Measure) %>%
+  mutate(value_std = (value - mean(value, na.rm = TRUE)) / sd(value, na.rm = TRUE))
+```
+
+# Variance-component analysis
+
+```{r}
+# Run models
+# Note: lmer() drops rows with NA in the outcome; donors with missing values are excluded per metric.
+
+## Raw (non-standardized) models
+mod_LG <- lmer(
+  value ~ 1 + (1 | Lab) + (1 | Donor),
+  data = mh_adi_long %>% filter(Measure == "LG_AUC")
+)
+
+mod_HG <- lmer(
+  value ~ 1 + (1 | Lab) + (1 | Donor),
+  data = mh_adi_long %>% filter(Measure == "HG_AUC")
+)
+
+mod_SI <- lmer(
+  value ~ 1 + (1 | Lab) + (1 | Donor),
+  data = mh_adi_long %>% filter(Measure == "SI")
+)
+
+## Standardized models - used z-transformed values
+mod_LG_std <- lmer(
+  value_std ~ 1 + (1 | Lab) + (1 | Donor),
+  data = mh_adi_long_std %>% filter(Measure == "LG_AUC")
+)
+
+mod_HG_std <- lmer(
+  value_std ~ 1 + (1 | Lab) + (1 | Donor),
+  data = mh_adi_long_std %>% filter(Measure == "HG_AUC")
+)
+
+mod_SI_std <- lmer(
+  value_std ~ 1 + (1 | Lab) + (1 | Donor),
+  data = mh_adi_long_std %>% filter(Measure == "SI")
+)
+```
+
+```{r}
+# Variance components
+vc_LG <- as.data.frame(VarCorr(mod_LG))
+vc_LG$prop <- vc_LG$vcov / sum(vc_LG$vcov)
+vc_LG$prop_pct <- 100 * vc_LG$prop
+
+vc_HG <- as.data.frame(VarCorr(mod_HG))
+vc_HG$prop <- vc_HG$vcov / sum(vc_HG$vcov)
+vc_HG$prop_pct <- 100 * vc_HG$prop
+
+vc_SI <- as.data.frame(VarCorr(mod_SI))
+vc_SI$prop <- vc_SI$vcov / sum(vc_SI$vcov)
+vc_SI$prop_pct <- 100 * vc_SI$prop
+```
+
+```{r}
+vc_LG_std <- as.data.frame(VarCorr(mod_LG_std))
+vc_LG_std$prop <- vc_LG_std$vcov / sum(vc_LG_std$vcov)
+vc_LG_std$prop_pct <- 100 * vc_LG_std$prop
+
+vc_HG_std <- as.data.frame(VarCorr(mod_HG_std))
+vc_HG_std$prop <- vc_HG_std$vcov / sum(vc_HG_std$vcov)
+vc_HG_std$prop_pct <- 100 * vc_HG_std$prop
+
+vc_SI_std <- as.data.frame(VarCorr(mod_SI_std))
+vc_SI_std$prop <- vc_SI_std$vcov / sum(vc_SI_std$vcov)
+vc_SI_std$prop_pct <- 100 * vc_SI_std$prop
+```
+
+# Intraclass Correlation Coefficients (ICC)
+
+```{r}
+ICC_LG_raw  <- ICC(mh_adi[, c("LG_AUC_Lab1", "LG_AUC_Lab2")])
+ICC_HG_raw  <- ICC(mh_adi[, c("HG_AUC_Lab1", "HG_AUC_Lab2")])
+ICC_SI_raw  <- ICC(mh_adi[, c("SI_Lab1",    "SI_Lab2")])
+
+ICC_LG_std <- ICC(mh_adi_std[, c("z_LG_AUC_Lab1", "z_LG_AUC_Lab2")])
+ICC_HG_std <- ICC(mh_adi_std[, c("z_HG_AUC_Lab1", "z_HG_AUC_Lab2")])
+ICC_SI_std <- ICC(mh_adi_std[, c("z_SI_Lab1",     "z_SI_Lab2")])
+```
+
+```{r}
+list(
+  LG_AUC_ICC_raw = ICC_LG_raw$results,
+  HG_AUC_ICC_raw = ICC_HG_raw$results,
+  SI_ICC_raw     = ICC_SI_raw$results,
+  
+  LG_AUC_ICC_std = ICC_LG_std$results,
+  HG_AUC_ICC_std = ICC_HG_std$results,
+  SI_ICC_std     = ICC_SI_std$results
+)
+```
+
+# Random-effects Meta-analysis
+
+```{r}
+# Remove rows with missing AUCs for Lab 1 (Bruin)
+lab1 <- mh_adi %>% 
+  dplyr::select(Donor, LG_AUC_Lab1, HG_AUC_Lab1) %>%
+  dplyr::filter(!is.na(LG_AUC_Lab1), !is.na(HG_AUC_Lab1))
+
+# Extract LG and HG values and the sample size
+lg1 <- lab1$LG_AUC_Lab1
+hg1 <- lab1$HG_AUC_Lab1
+n1  <- length(lg1)
+
+# Calculate within-donor correlation LG vs HG for paired effect size
+r1 <- cor(lg1, hg1, use = "complete.obs")
+
+# Compute effect size: LG vs HG for Lab 1
+es_lab1 <- escalc(
+  measure = "SMCR",          
+  m1i = mean(lg1),           
+  m2i = mean(hg1),           
+  sd1i = sd(lg1),            
+  sd2i = sd(hg1),            
+  ri  = r1,                  
+  ni  = n1
+)
+
+es_lab1$yi  # effect size estimate (Hedges-type g)
+es_lab1$vi  # sampling variance
+```
+
+```{r}
+# Remove rows with missing AUCs for Lab 2 (IsletCore)
+lab2 <- mh_adi %>% 
+  dplyr::select(Donor, LG_AUC_Lab2, HG_AUC_Lab2) %>%
+  dplyr::filter(!is.na(LG_AUC_Lab2), !is.na(HG_AUC_Lab2))
+
+# Extract LG and HG values and the sample size
+lg2 <- lab2$LG_AUC_Lab2
+hg2 <- lab2$HG_AUC_Lab2
+n2  <- length(lg2)
+
+# Calculate within-donor correlation LG vs HG for paired effect size
+r2 <- cor(lg2, hg2, use = "complete.obs")
+
+# Compute effect size: LG vs HG for Lab 2
+es_lab2 <- escalc(
+  measure = "SMCR",
+  m1i = mean(lg2),
+  m2i = mean(hg2),
+  sd1i = sd(lg2),
+  sd2i = sd(hg2),
+  ri  = r2,
+  ni  = n2
+)
+
+es_lab2$yi
+es_lab2$vi
+```
+
+```{r}
+esdat <- data.frame(
+  lab = c("Lab1", "Lab2"),
+  yi  = c(es_lab1$yi, es_lab2$yi),
+  vi  = c(es_lab1$vi, es_lab2$vi)
+)
+
+esdat
+```
+
+```{r}
+# Meta-analysis via linear mixed-effects model
+# yi = effect sizes, vi = sampling variances, REML = Residual Maximum Likelihood
+res <- rma(yi = yi, vi = vi, data = esdat, method = "REML")
+res
+```
+
+```{r}
+# Extract and view results
+pooled_g   <- res$b[1] 
+se         <- res$se 
+ci_lower   <- res$ci.lb 
+ci_upper   <- res$ci.ub 
+tau2       <- res$tau2
+I2         <- res$I2
+
+c(pooled_g = pooled_g, se = se, ci_lower = ci_lower, ci_upper = ci_upper,
+  tau2 = tau2, I2 = I2)
+```
+
+```{r}
+forest(
+  res,
+  slab = esdat$lab,
+  xlab = "Standardized mean change (HG vs LG)",
+  mlab = "Random-effects model"
+)
+
+funnel(
+  res,
+  xlab = "Effect size (yi)",
+  ylab = "Standard error"
+)
+```
+
+# Generate a summary table
+
+```{r}
+# ICC(2,1) for each metric (standardized)
+ICC_LG  <- icc2_from_psych(ICC_LG_std)
+ICC_HG  <- icc2_from_psych(ICC_HG_std)
+ICC_SI  <- icc2_from_psych(ICC_SI_std)
+
+# Meta-analysis stats for HG vs LG
+meta_row <- list(
+  pooled_g = as.numeric(res$b[1]),
+  ci_low   = as.numeric(res$ci.lb),
+  ci_high  = as.numeric(res$ci.ub),
+  tau2     = as.numeric(res$tau2),
+  I2       = as.numeric(res$I2)
+)
+
+# Assemble summary table
+summary_table <- tibble::tibble(
+  Metric = c("LG AUC", "HG AUC", "Stimulation Index"),
+
+  # ICC2 from standardized data
+  ICC2 = c(ICC_LG$ICC2, ICC_HG$ICC2, ICC_SI$ICC2),
+  ICC2_CI = c(
+    sprintf("[%.2f, %.2f]", ICC_LG$ICC2_low, ICC_LG$ICC2_high),
+    sprintf("[%.2f, %.2f]", ICC_HG$ICC2_low, ICC_HG$ICC2_high),
+    sprintf("[%.2f, %.2f]", ICC_SI$ICC2_low, ICC_SI$ICC2_high)
+  ),
+  ICC2_p = c(ICC_LG$ICC2_p, ICC_HG$ICC2_p, ICC_SI$ICC2_p),
+
+  # Variance components (%)
+  Donor_var_pct    = c(
+    get_vc_row(vc_LG, "Donor"),
+    get_vc_row(vc_HG, "Donor"),
+    get_vc_row(vc_SI, "Donor")
+  ),
+  Lab_var_pct      = c(
+    get_vc_row(vc_LG, "Lab"),
+    get_vc_row(vc_HG, "Lab"),
+    get_vc_row(vc_SI, "Lab")
+  ),
+  Residual_var_pct = c(
+    get_vc_row(vc_LG, "Residual"),
+    get_vc_row(vc_HG, "Residual"),
+    get_vc_row(vc_SI, "Residual")
+  ),
+
+  # Meta-analysis (only meaningful for HG vs LG; NA for others)
+  pooled_g = c(NA, meta_row$pooled_g, NA),
+  meta_CI  = c(
+    NA,
+    sprintf("[%.2f, %.2f]", meta_row$ci_low, meta_row$ci_high),
+    NA
+  ),
+  tau2     = c(NA, meta_row$tau2, NA),
+  I2       = c(NA, meta_row$I2, NA)
+)
+
+summary_table
+```
+
+## Full ICC table (raw + standardized)
+
+```{r}
+# Convert each ICC extraction to a tibble before mutate()
+icc_LG_raw_tbl  <- as_tibble(icc2_from_psych(ICC_LG_raw)) %>%
+  mutate(Metric = "LG AUC", Type = "Raw")
+
+icc_HG_raw_tbl  <- as_tibble(icc2_from_psych(ICC_HG_raw)) %>%
+  mutate(Metric = "HG AUC", Type = "Raw")
+
+icc_SI_raw_tbl  <- as_tibble(icc2_from_psych(ICC_SI_raw)) %>%
+  mutate(Metric = "SI", Type = "Raw")
+
+icc_LG_std_tbl  <- as_tibble(icc2_from_psych(ICC_LG_std)) %>%
+  mutate(Metric = "LG AUC", Type = "Standardized")
+
+icc_HG_std_tbl  <- as_tibble(icc2_from_psych(ICC_HG_std)) %>%
+  mutate(Metric = "HG AUC", Type = "Standardized")
+
+icc_SI_std_tbl  <- as_tibble(icc2_from_psych(ICC_SI_std)) %>%
+  mutate(Metric = "SI", Type = "Standardized")
+
+icc_full_table <- bind_rows(
+  icc_LG_raw_tbl,
+  icc_HG_raw_tbl,
+  icc_SI_raw_tbl,
+  icc_LG_std_tbl,
+  icc_HG_std_tbl,
+  icc_SI_std_tbl
+) %>%
+  relocate(Metric, Type) %>%
+  mutate(
+    ICC2_CI = sprintf("[%.2f, %.2f]", ICC2_low, ICC2_high)
+  )
+
+icc_full_table
+```
+## Variance-component table (Donor vs Lab vs Residual)
+
+```{r}
+# vc_props is a helper function to compute % variance per random-effect group
+
+# Raw models
+vc_LG_tbl <- vc_props(mod_LG, "LG AUC", "Raw")
+vc_HG_tbl <- vc_props(mod_HG, "HG AUC", "Raw")
+vc_SI_tbl <- vc_props(mod_SI, "SI",     "Raw")
+
+# Standardized models
+vc_LG_std_tbl <- vc_props(mod_LG_std, "LG AUC", "Standardized")
+vc_HG_std_tbl <- vc_props(mod_HG_std, "HG AUC", "Standardized")
+vc_SI_std_tbl <- vc_props(mod_SI_std, "SI",     "Standardized")
+
+# Combine
+vc_full_table <- bind_rows(
+  vc_LG_tbl,
+  vc_HG_tbl,
+  vc_SI_tbl,
+  vc_LG_std_tbl,
+  vc_HG_std_tbl,
+  vc_SI_std_tbl
+) %>%
+  # nicer labels
+  mutate(
+    grp = dplyr::recode(grp,
+                        "Donor"    = "Donor",
+                        "Lab"      = "Lab",
+                        "Residual" = "Residual")
+  )
+
+vc_full_table
+```
+
+```{r}
+vc_full_wide <- vc_full_table %>%
+  select(Metric, Type, grp, prop_pct) %>%
+  tidyr::pivot_wider(
+    names_from = grp,
+    values_from = prop_pct,
+    names_prefix = "VarPct_"
+  )
+
+vc_full_wide
+```
+
+## Meta-analysis of HG vs LG effect size
+
+```{r}
+# Inspect effect sizes per lab
+esdat  # lab, yi, vi
+
+# Meta-analysis result summary table
+meta_summary <- tibble(
+  pooled_g = as.numeric(res$b[1]),
+  ci_low   = as.numeric(res$ci.lb),
+  ci_high  = as.numeric(res$ci.ub),
+  tau2     = as.numeric(res$tau2),
+  I2       = as.numeric(res$I2)
+) %>%
+  mutate(
+    CI = sprintf("[%.2f, %.2f]", ci_low, ci_high)
+  )
+
+meta_summary
+```
+## Lab1 vs Lab2 scatter plots (raw and standardized)
+
+```{r}
+# LG AUC
+ggplot(mh_adi, aes(x = LG_AUC_Lab1, y = LG_AUC_Lab2)) +
+  geom_point() +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  labs(
+    title = "LG AUC: Lab 1 vs Lab 2",
+    x = "Lab 1 LG AUC",
+    y = "Lab 2 LG AUC"
+  ) +
+  theme_minimal()
+
+# HG AUC
+ggplot(mh_adi, aes(x = HG_AUC_Lab1, y = HG_AUC_Lab2)) +
+  geom_point() +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  labs(
+    title = "HG AUC: Lab 1 vs Lab 2",
+    x = "Lab 1 HG AUC",
+    y = "Lab 2 HG AUC"
+  ) +
+  theme_minimal()
+
+# SI
+ggplot(mh_adi, aes(x = SI_Lab1, y = SI_Lab2)) +
+  geom_point() +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  labs(
+    title = "Stimulation Index: Lab 1 vs Lab 2",
+    x = "Lab 1 SI",
+    y = "Lab 2 SI"
+  ) +
+  theme_minimal()
+```
+```{r}
+# LG AUC z-scored
+ggplot(mh_adi_std, aes(x = z_LG_AUC_Lab1, y = z_LG_AUC_Lab2)) +
+  geom_point() +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  labs(
+    title = "LG AUC (z-scored): Lab 1 vs Lab 2",
+    x = "Lab 1 z(LG AUC)",
+    y = "Lab 2 z(LG AUC)"
+  ) +
+  theme_minimal()
+
+# HG AUC z-scored
+ggplot(mh_adi_std, aes(x = z_HG_AUC_Lab1, y = z_HG_AUC_Lab2)) +
+  geom_point() +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  labs(
+    title = "HG AUC (z-scored): Lab 1 vs Lab 2",
+    x = "Lab 1 z(HG AUC)",
+    y = "Lab 2 z(HG AUC)"
+  ) +
+  theme_minimal()
+
+# SI z-scored
+ggplot(mh_adi_std, aes(x = z_SI_Lab1, y = z_SI_Lab2)) +
+  geom_point() +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  labs(
+    title = "Stimulation Index (z-scored): Lab 1 vs Lab 2",
+    x = "Lab 1 z(SI)",
+    y = "Lab 2 z(SI)"
+  ) +
+  theme_minimal()
+```
+
+# Session Info
+
+```{r}
+sessionInfo()
+```
