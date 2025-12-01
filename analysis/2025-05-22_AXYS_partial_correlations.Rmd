@@ -1,0 +1,533 @@
+---
+title: "AXYS Project Grant: Partial Correlations"
+author: "Angela Ching"
+date: "`r Sys.Date()`"
+output: 
+  html_notebook:
+    toc: yes
+---
+
+# Packages
+
+```{r}
+library(tidyverse)    # contains ggplot2, purrr, etc.
+library(readxl)
+library(janitor)      # for data cleaning
+library(scico)        # colour palettes
+library(ggsci)        # colour palettes
+library(ggpubr)       # for scatterplot correlations
+library(psychometric) # masks "select" from dplyr; for CIr()
+library(reshape2)     # for reshaping data for heatmaps
+library(knitr)
+library(pheatmap)
+library(corrplot)
+library(psych)
+library(lme4)
+library(moments)
+library(gridExtra)
+library(ppcor)       # for partial correlations
+library(here)
+```
+
+```{r}
+source(here::here("functions", "correlation_functions.R"))       # General correlation functions
+source(here::here("functions", "percent_change.R"))              # Calculate percent change (sensitivity analyses)
+source(here::here("functions", "partial_correlation_functions.R"))
+```
+
+# Load AXYS data
+
+```{r}
+# load chemical list
+chem_list <- read_csv(here::here("data", "2022-10-18_AXYS_chemicals_list_AC.csv")) %>%
+  dplyr::select(Compound, Dioxin_subtype) %>%
+  mutate(across(where(is.character), str_squish))
+
+chem_list_2 <- read_csv(here::here("data", "2024-10-01_AXYS_chemicals_list_with_coelutions.csv")) %>%
+  dplyr::select(-c(Dioxin_subtype, Type)) %>%
+  mutate(across(where(is.character), str_squish))
+
+# load AXYS data
+axys_pops <- read_csv(here::here("outputs", "2024-08-24_ProjectGrant_excluded_outliers_for_single_analyte_analyses.csv")) %>%
+  dplyr::select(-c(CONC_BLANK_adj, IS_BLANK_ADJ_CONC_HIGHER_THAN_LOD)) %>%
+  mutate(BLANK_and_LOD_adj = as.numeric(BLANK_and_LOD_adj),
+         File = factor(File),
+         COMPOUND = case_when(str_detect(COMPOUND, "TOTAL") ~ str_to_sentence(COMPOUND),
+                              str_detect(COMPOUND, " Epoxide") ~ str_to_sentence(COMPOUND),
+                              TRUE ~ COMPOUND),
+         across(where(is.character), str_squish))
+
+axys_pops_2 <- axys_pops %>%
+  dplyr::select(-c(File, LAB_FLAG, DETECTION_LIMIT)) %>%
+  mutate(across(where(is.character), str_squish))
+
+# load AXYS data with imputed values for true NAs (chemicals not measured by AXYS in certain donors)
+axys_pops_imputed_panc <- read_excel(here::here("outputs", "2024-09-03_axys_pops_includes_imputed_values_for_true_NAs_using_mice_package.xlsx"), sheet = 1) %>%
+  mutate(across(where(is.character), str_squish))
+
+axys_pops_imputed_adip <- read_excel(here::here("outputs", "2024-09-03_axys_pops_includes_imputed_values_for_true_NAs_using_mice_package.xlsx"), sheet = 2) %>%
+  mutate(across(where(is.character), str_squish))
+
+# load AXYS donor metadata
+axys_metadata <- read_csv(here::here("data", "2024-08-22_donor_characteristics_FINAL.csv"),show_col_types = FALSE) %>%
+  mutate(BMI_category = case_when(BMI < 24.9 ~ "Lean",
+                                  BMI >= 24.9 & BMI <= 29.9 ~ "Overweight",
+                                  BMI > 29.9 ~ "Obese"),
+         Hba1c_category = case_when(Hba1c < 6 ~ "Normoglycemic",
+                                    Hba1c <= 6.5 ~ "Prediabetic",
+                                    Hba1c > 6.5 ~ "Diabetic"),
+         BMI_category = factor(BMI_category, levels = c("Lean", "Overweight", "Obese")),
+         Hba1c_category = factor(Hba1c_category, levels = c("Normoglycemic", "Prediabetic", "Diabetic")),
+         Sex = as_factor(Sex),
+         Diabetes_status = as_factor(Diabetes_status)) %>%
+  dplyr::select(-Purity)
+
+# Donor IDs
+axys_donors <- axys_metadata %>%
+  dplyr::select(Id)
+
+# Subset data by tissue type
+subset_tissue <- function(tissue) {
+  axys_pops_2 %>%
+    dplyr::filter(!str_detect(COMPOUND, "Total"), TISSUE_TYPE == tissue) %>%
+    dplyr::select(DONOR, COMPOUND, BLANK_and_LOD_adj) %>%
+    group_by(DONOR) %>%
+    pivot_wider(names_from = COMPOUND, values_from = BLANK_and_LOD_adj) %>%
+    ungroup()
+}
+
+axys_pops_panc <- subset_tissue("Pancreas")
+axys_pops_adip <- subset_tissue("Adipose")
+```
+
+# Load data on glucose parameters
+
+## ADI Islet Core: Static GSIS
+
+```{r}
+# load GSIS data from ADI
+gsis_adi_param <- read_excel(here::here("data", "Perifusion+GSIS", "2024-05-18_IsletCore_GSIS_from_TeamGrant_website.xlsx")) %>%
+  dplyr::mutate(Cond = factor(Cond, levels = c("1", "2", "3")),
+                replicate = as.character(replicate))
+
+gsis_adi_ave <- gsis_adi_param %>%
+  mutate(across(4:ncol(.), as.numeric)) %>%
+  group_by(Donor, Cond) %>%
+  dplyr::mutate(InsulinContent_IsletCore = mean(InsulinContent),
+                LG_IsletCore = mean(LG, na.rm = TRUE),
+                HG_IsletCore = mean(HG, na.rm = TRUE),
+                SI_IsletCore = mean(SI, na.rm = TRUE),
+                .keep = c("unused")) %>%
+  distinct(Donor, Cond, .keep_all = TRUE) %>%
+  dplyr::select(-replicate) %>%
+  ungroup()
+  
+gsis_adi_wide <- gsis_adi_ave %>%
+  pivot_wider(names_from = Cond, values_from = c(InsulinContent_IsletCore, LG_IsletCore, HG_IsletCore, SI_IsletCore)) %>%
+  relocate(Donor, InsulinContent_IsletCore_1, LG_IsletCore_1, HG_IsletCore_1, SI_IsletCore_1,
+           InsulinContent_IsletCore_2, LG_IsletCore_2, HG_IsletCore_2, SI_IsletCore_2,
+           InsulinContent_IsletCore_3, LG_IsletCore_3, HG_IsletCore_3, SI_IsletCore_3)
+
+# Load pre-GSIS total insulin content
+gsis_adi_preInsCont <- read_csv(here::here("data", "Perifusion+GSIS", "2025-07-25_team_grant_website_isolation_info.csv")) %>%
+  dplyr::select("record_id", "insulincontent") %>%
+  dplyr::mutate(PreInsulinContent_IsletCore = insulincontent,
+                .keep = c("unused"))
+
+# Combine pre-GSIS total insulin content with the rest of the dataset
+gsis_adi <- gsis_adi_wide %>%
+  left_join(., gsis_adi_preInsCont, by = c("Donor" = "record_id"))
+```
+
+## Jelena Kolic: Glucose, leucine, and fatty acid perifusions
+
+```{r}
+# Load perifusion data from Jelena Kolic
+peri_jk <- read_excel(here::here("data", "Perifusion+GSIS", "2024-04-06_Jelena_all_perifusion_AUCs.xlsx")) %>%
+ dplyr::mutate(PerifusionParam = str_c("JK", PerifusionParam, sep = "_"),
+         .keep = "unused") %>%
+  mutate(across(4:ncol(.), as.numeric))
+
+# Separate data based on perifusion type (glucose, leucine, oleate-pamlitate)
+glu_peri_jk <- peri_jk %>%
+  dplyr::filter(Secretagogue == "GLU") %>%
+  remove_empty("cols")
+
+leu_peri_jk <- peri_jk %>%
+  dplyr::filter(Secretagogue == "LEU") %>%
+  remove_empty("cols")
+
+fa_peri_jk <- peri_jk %>%
+  dplyr::filter(Secretagogue == "OLE-PALM") %>%
+  remove_empty("cols")
+
+# Transpose for matrices
+glu_peri_jk_t <- glu_peri_jk %>%
+  dplyr::select(-c(MainOutcome, Secretagogue)) %>%
+  t() %>%
+  as.data.frame() %>%
+  set_names(.[1, ]) %>%
+  slice_tail(., n = (nrow(.)-1)) %>%
+  mutate(Donor = rownames(.),
+         .keep = c("unused")) %>%
+  mutate(Donor = str_remove(Donor, pattern = "Donor"),
+         across(where(is.character), str_squish)) %>%
+  relocate(Donor) %>%
+  dplyr::filter(Donor %in% axys_donors$Id) %>%
+  dplyr::mutate(across(2:ncol(.), as.numeric))
+
+leu_peri_jk_t <- leu_peri_jk %>%
+  dplyr::select(-c(MainOutcome, Secretagogue)) %>%
+  t() %>%
+  as.data.frame() %>%
+  set_names(.[1, ]) %>%
+  slice_tail(., n = (nrow(.)-1)) %>%
+  mutate(Donor = rownames(.),
+         .keep = c("unused")) %>%
+  mutate(Donor = str_remove(Donor, pattern = "Donor"),
+         across(where(is.character), str_squish)) %>%
+  relocate(Donor) %>%
+  dplyr::filter(Donor %in% axys_donors$Id) %>%
+  dplyr::mutate(across(2:ncol(.), as.numeric))
+
+fa_peri_jk_t <- fa_peri_jk %>%
+  dplyr::select(-c(MainOutcome, Secretagogue)) %>%
+  t() %>%
+  as.data.frame() %>%
+  set_names(.[1, ]) %>%
+  slice_tail(., n = (nrow(.)-1)) %>%
+  mutate(Donor = rownames(.),
+         .keep = c("unused")) %>%
+  mutate(Donor = str_remove(Donor, pattern = "Donor"),
+         across(where(is.character), str_squish)) %>%
+  relocate(Donor) %>%
+  dplyr::filter(Donor %in% axys_donors$Id) %>%
+  dplyr::mutate(across(2:ncol(.), as.numeric))
+```
+
+## Bruin Lab: Glucose perifusion
+
+```{r}
+# Load Myriam perifusion data
+glu_peri_mh <- read_excel(here::here("data", "Perifusion+GSIS", "2024-01-25_Perifusion_FINAL DATA_For analysis_AC.xlsx")) %>%
+  mutate(PerifusionParam = str_c("MH", PerifusionParam, sep = "_"),
+         .keep = c("unused")) %>%
+  mutate(across(3:ncol(.), as.numeric))
+
+glu_peri_mh_t <- glu_peri_mh %>%
+  dplyr::select(-MainOutcome) %>%
+  t() %>%
+  as.data.frame() %>%
+  set_names(.[1, ]) %>%
+  slice_tail(., n = (nrow(.)-1)) %>%
+  mutate(Donor = rownames(.),
+         .keep = c("unused")) %>%
+  mutate(Donor = str_remove(Donor, pattern = "Donor"),
+         across(where(is.character), str_squish)) %>%
+  relocate(Donor) %>%
+  dplyr::filter(Donor %in% axys_donors$Id) %>%
+  dplyr::mutate(across(2:ncol(.), as.numeric))
+```
+
+# Analysis prep
+
+## Create compounds lists by class
+
+```{r}
+# Create compounds list by class
+dioxin_list <- chem_list_2 %>%
+  dplyr::filter(Dioxin_similarity == "Dioxin") %>%
+  dplyr::pull(Compound) %>%
+  c("Dioxin")
+
+pcb_list <- chem_list_2 %>%
+  dplyr::filter(Dioxin_similarity == "DL" | Dioxin_similarity == "NDL") %>%
+  dplyr::pull(Compound) %>%
+  c("PCB", "DL", "NDL")
+
+ocp_list <- chem_list_2 %>%
+  dplyr::filter(Dioxin_similarity == "OCP") %>%
+  dplyr::pull(Compound)
+
+# Create a list of vectors of analyte names
+analyte_groups <- list(
+  dioxin = dioxin_list,   
+  pcb    = pcb_list,      
+  ocp    = ocp_list       
+)
+```
+
+## Create GSIS parameters list by type
+
+```{r}
+gsis_adi_list <- names(dplyr::select(gsis_adi, -Donor))
+glu_peri_jk_list <- names(dplyr::select(glu_peri_jk_t, -Donor))
+leu_peri_jk_list <- names(dplyr::select(leu_peri_jk_t, -Donor))
+fa_peri_jk_list <- names(dplyr::select(fa_peri_jk_t, -Donor))
+glu_peri_mh_list <- names(dplyr::select(glu_peri_mh_t, -Donor))
+
+# Create a list of vectors with GSIS parameter names by type
+gsis_groups <- list(
+  core   = gsis_adi_list,
+  jk_glu = glu_peri_jk_list,
+  jk_leu = leu_peri_jk_list,
+  jk_fa  = fa_peri_jk_list,
+  mh_glu = glu_peri_mh_list
+)
+```
+
+## Calculate dioxin and PCB sums
+
+```{r}
+# Calculate sums
+axys_panc_sums <- axys_pops_panc %>%
+  pivot_longer(cols = 2:ncol(.), names_to = "COMPOUND", values_to = "ADJ_CONC") %>%
+  left_join(., chem_list_2, by = c("COMPOUND" = "Compound")) %>%
+  group_by(DONOR, Dioxin_similarity) %>%
+  mutate(AnalyteSums = sum(ADJ_CONC, na.rm = TRUE)) %>%
+  ungroup() %>%
+  group_by(DONOR, Dioxin_similarity, AnalyteSums) %>%
+  summarise() %>%
+  pivot_wider(names_from = Dioxin_similarity, values_from = AnalyteSums) %>%
+  mutate(PCB = rowSums(across(c("DL", "NDL")))) %>%
+  dplyr::select(-OCP) %>%
+  relocate(DONOR, Dioxin, PCB)
+
+axys_adip_sums <- axys_pops_adip %>%
+  pivot_longer(cols = 2:ncol(.), names_to = "COMPOUND", values_to = "ADJ_CONC") %>%
+  left_join(., chem_list_2, by = c("COMPOUND" = "Compound")) %>%
+  group_by(DONOR, Dioxin_similarity) %>%
+  mutate(AnalyteSums = sum(ADJ_CONC, na.rm = TRUE)) %>%
+  ungroup() %>%
+  group_by(DONOR, Dioxin_similarity, AnalyteSums) %>%
+  summarise() %>%
+  pivot_wider(names_from = Dioxin_similarity, values_from = AnalyteSums) %>%
+  mutate(PCB = rowSums(across(c("DL", "NDL")))) %>%
+  dplyr::select(-OCP) %>%
+  relocate(DONOR, Dioxin, PCB)
+```
+
+```{r}
+# Combine single analyte concentrations with sums
+axys_pops_with_sums_panc <- axys_pops_panc %>%
+  left_join(., axys_panc_sums, by = c("DONOR" = "DONOR"))
+
+axys_pops_with_sums_adip <- axys_pops_adip %>%
+  left_join(., axys_adip_sums, by = c("DONOR" = "DONOR"))
+
+# Combine single analyte concentrations with metadata
+axys_pops_with_sums_panc_meta <- axys_pops_with_sums_panc %>%
+  left_join(., axys_metadata, by = c("DONOR" = "Id")) %>%
+  dplyr::select(-Hba1c_category)
+
+axys_pops_with_sums_adip_meta <- axys_pops_with_sums_adip %>%
+  left_join(., axys_metadata, by = c("DONOR" = "Id")) %>%
+  dplyr::select(-Hba1c_category)
+```
+
+## Create separate dataframes for each pollutant class
+
+```{r}
+## Pancreas and adipose POPs without metadata
+
+# Dioxins
+axys_pops_panc_dioxin <- axys_pops_with_sums_panc_meta %>%
+  dplyr::select(DONOR, any_of(dioxin_list), Dioxin)
+
+axys_pops_adip_dioxin <- axys_pops_with_sums_adip_meta %>%
+  dplyr::select(DONOR, any_of(dioxin_list), Dioxin)
+
+# PCBs
+axys_pops_panc_pcb <- axys_pops_with_sums_panc_meta %>%
+  dplyr::select(DONOR, any_of(pcb_list), PCB, "DL", "NDL")
+
+axys_pops_adip_pcb <- axys_pops_with_sums_adip_meta %>%
+  dplyr::select(DONOR, any_of(pcb_list), PCB, "DL", "NDL")
+
+# OCPs
+axys_pops_panc_ocp <- axys_pops_with_sums_panc_meta %>%
+  dplyr::select(DONOR, any_of(ocp_list))
+
+axys_pops_adip_ocp <- axys_pops_with_sums_adip_meta %>%
+  dplyr::select(DONOR, any_of(ocp_list))
+```
+
+```{r}
+## POPs with metadata
+
+# Dioxins
+axys_pops_panc_dioxin_meta <- axys_pops_with_sums_panc_meta %>%
+  dplyr::select(DONOR, any_of(dioxin_list), Dioxin, Age, BMI)
+
+axys_pops_adip_dioxin_meta <- axys_pops_with_sums_adip_meta %>%
+  dplyr::select(DONOR, any_of(dioxin_list), Dioxin, Age, BMI)
+
+# PCBs
+axys_pops_panc_pcb_meta <- axys_pops_with_sums_panc_meta %>%
+  dplyr::select(DONOR, any_of(pcb_list), PCB, "DL", "NDL", Age, BMI)
+
+axys_pops_adip_pcb_meta <- axys_pops_with_sums_adip_meta %>%
+  dplyr::select(DONOR, any_of(pcb_list), PCB, "DL", "NDL", Age, BMI)
+
+# OCPs
+axys_pops_panc_ocp_meta <- axys_pops_with_sums_panc_meta %>%
+  dplyr::select(DONOR, any_of(ocp_list), Age, BMI)
+
+axys_pops_adip_ocp_meta <- axys_pops_with_sums_adip_meta %>%
+  dplyr::select(DONOR, any_of(ocp_list), Age, BMI)
+```
+
+# Partial correlations
+
+## Correlate analyte concentrations within each pollutant class
+
+```{r}
+## Create lists with the combined dataframes (POPs data + donor characteristics)
+# Pancreas
+axys_pops_with_sums_panc_with_meta_list <- list(
+  axys_pops_panc_dioxin_meta = axys_pops_panc_dioxin_meta,
+  axys_pops_panc_pcb_meta = axys_pops_panc_pcb_meta,
+  axys_pops_panc_ocp_meta = axys_pops_panc_ocp_meta
+)
+
+# Adipose
+axys_pops_with_sums_adip_with_meta_list <- list(
+  axys_pops_adip_dioxin_meta = axys_pops_adip_dioxin_meta,
+  axys_pops_adip_pcb_meta = axys_pops_adip_pcb_meta,
+  axys_pops_adip_ocp_meta = axys_pops_adip_ocp_meta
+)
+```
+
+```{r}
+# Perform partial correlations
+out_panc_pops <- partial_ppcor_pops(
+  pops_list      = axys_pops_with_sums_panc_with_meta_list,
+  analyte_groups = analyte_groups,
+  tissue_label   = "Pancreas",
+  method         = "kendall",
+  fdr_scope      = "within",
+  symmetric      = TRUE,     
+  donor_col      = "DONOR"
+)
+
+out_adip_pops <- partial_ppcor_pops(
+  pops_list      = axys_pops_with_sums_adip_with_meta_list,
+  analyte_groups = analyte_groups,
+  tissue_label   = "Adipose",
+  method         = "kendall",
+  fdr_scope      = "within",
+  symmetric      = TRUE,     
+  donor_col      = "DONOR"
+)
+```
+
+## Correlate analyte concentrations with GSIS parameters
+
+```{r}
+# Create list of dataframes with analyte concentrations by pollutant class
+pops_meta_dfs_panc <- list(
+  dioxin = axys_pops_panc_dioxin_meta,
+  pcb    = axys_pops_panc_pcb_meta,
+  ocp    = axys_pops_panc_ocp_meta
+)
+
+pops_meta_dfs_adip <- list(
+  dioxin = axys_pops_adip_dioxin_meta,
+  pcb    = axys_pops_adip_pcb_meta,
+  ocp    = axys_pops_adip_ocp_meta
+)
+
+gsis_types <- list(
+  core   = gsis_adi,
+  jk_glu = glu_peri_jk_t,
+  jk_leu = leu_peri_jk_t,
+  jk_fa  = fa_peri_jk_t,
+  mh_glu = glu_peri_mh_t
+)
+```
+
+```{r}
+# Join function for combining analyte dataframes with functional parameters
+join_gsis_data <- function(exposure_df, gsis_target_list, convert_numeric = FALSE) {
+  purrr::imap(gsis_target_list, function(gsis_df, suffix) {
+    result <- dplyr::left_join(exposure_df, gsis_df, by = c("DONOR" = "Donor"))
+    if (convert_numeric) {
+      result <- result %>% dplyr::mutate(across(2:ncol(.), as.numeric))
+    }
+    result
+  })
+}
+```
+
+```{r}
+# Join dataframes
+pops_with_gsis_panc <- imap(pops_meta_dfs_panc, ~ join_gsis_data(.x, gsis_types, convert_numeric = TRUE))
+pops_with_gsis_adip <- imap(pops_meta_dfs_adip, ~ join_gsis_data(.x, gsis_types, convert_numeric = TRUE))
+```
+
+```{r}
+# Perform partial correlations
+out_panc_long <- partial_ppcor_over_list(
+  pops_list      = pops_with_gsis_panc,
+  analyte_groups = analyte_groups,
+  gsis_groups    = gsis_groups,
+  tissue_label   = "Pancreas",
+  gsis_suffix    = FALSE,            
+  method         = "kendall",
+  fdr_scope      = "within",
+  symmetric      = FALSE,
+  donor_col      = "DONOR"
+)
+
+out_adip_long <- partial_ppcor_over_list(
+  pops_list      = pops_with_gsis_adip,
+  analyte_groups = analyte_groups,
+  gsis_groups    = gsis_groups,
+  tissue_label   = "Adipose",
+  gsis_suffix    = FALSE,            
+  method         = "kendall",
+  fdr_scope      = "within",
+  symmetric      = FALSE,
+  donor_col      = "DONOR"
+)
+
+out_panc_wide <- out_panc_long %>%
+  dplyr::mutate(r_ci = sprintf("%.2f [%.2f, %.2f]", r, r_lower, r_upper)) %>%
+  dplyr::select(var1, var2, tissue, pollutant_class, gsis_type,
+                adjustment, r, r_ci, p, p_adj, n) %>% 
+  tidyr::pivot_wider(
+    names_from  = adjustment,
+    values_from = c(r_ci, r, p, p_adj, n),
+    names_glue  = "{.value}_{adjustment}"
+  )
+
+out_adip_wide <- out_adip_long %>%
+  dplyr::mutate(r_ci = sprintf("%.2f [%.2f, %.2f]", r, r_lower, r_upper)) %>%
+  dplyr::select(var1, var2, tissue, pollutant_class, gsis_type,
+                adjustment, r, r_ci, p, p_adj, n) %>% 
+  tidyr::pivot_wider(
+    names_from  = adjustment,
+    values_from = c(r_ci, r, p, p_adj, n),
+    names_glue  = "{.value}_{adjustment}"
+  )
+```
+
+```{r}
+# Export dataframes
+# library(writexl)
+# 
+# write_xlsx(
+#   list(
+#     panc_partial_corr = out_panc_wide,
+#     adip_partial_corr = out_adip_wide
+#   ),
+#   path = "2025-08-25_partial_correlation_results.xlsx"
+# )
+```
+
+# Session Info
+
+```{r}
+sessionInfo()
+```
+
