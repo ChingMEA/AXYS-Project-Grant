@@ -25,15 +25,13 @@ Exclusion criteria
 # Packages
 
 ```{r packages}
-library(tidyverse)
+library(tidyverse)    # contains ggplot2, purrr, etc.
 library(readxl)
-library(ggplot2)
 library(janitor)      # for data cleaning
 library(scico)        # colour palettes
 library(ggsci)        # colour palettes
 library(ggpubr)       # for scatterplot correlations
 library(psychometric) # masks "select" from dplyr; for CIr()
-library(purrr)        # for mapping heatmaps
 library(reshape2)     # for reshaping data for heatmaps
 library(knitr)
 library(pheatmap)
