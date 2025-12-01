@@ -1,0 +1,87 @@
+###############
+# R / RStudio #
+###############
+.Rhistory
+.Rapp.history
+.RData
+.Ruserdata
+.Rproj.user/
+.Rproj.user/**
+.Rproj.user/*
+
+# RStudio project files (optional)
+*.Rproj
+
+###############
+# Data Files  #
+###############
+# REAL DATA SHOULD NOT BE VERSIONED
+data/**/*.csv
+data/**/*.xlsx
+data/**/*.xls
+data/**/*.txt
+data/**/*.tsv
+data/**/*.rds
+data/**/*.RData
+data/**/*.Rda
+
+# Allow the example synthetic data subfolder to be committed
+!data/example/
+!data/example/*
+
+##########################
+# Outputs / Results / Plots
+##########################
+outputs/
+outputs/*
+
+# Common output file types you never want in Git
+*.pdf
+*.png
+*.jpg
+*.jpeg
+*.tiff
+*.svg
+
+*.html
+*.htm
+*.nb.html
+
+*.csv
+*.tsv
+*.xlsx
+
+##########################
+# Logs, cache, temp files
+##########################
+*.log
+*.tmp
+*.cache
+*.bak
+
+# knitr / rmarkdown cache
+*_cache/
+cache/
+*.knit.md
+
+# Quarto / Rmarkdown artefacts
+*.utf8.md
+*.knit.md
+
+##########################
+# Python (if ever used)  #
+##########################
+__pycache__/
+*.pyc
+
+##########################
+# Mac / System Files
+##########################
+.DS_Store
+Thumbs.db
+
+##########################
+# SLURM / HPC outputs
+##########################
+slurm-*.out
+slurm-*.err
