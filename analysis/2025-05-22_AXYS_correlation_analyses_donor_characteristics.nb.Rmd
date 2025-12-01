@@ -1,0 +1,720 @@
+---
+title: "Correlating AXYS pollutant concentrations with donor characteristics"
+author: "Angela Ching"
+date: "`r Sys.Date()`"
+output: 
+  html_notebook:
+    toc: yes
+---
+
+# Notes from MH
+
+IsletCore GSIS:
+- Condition #1 = LG 2.8mM, HG 16.7mM 
+- Condition #2 = LG 1mM, HG 16.7mM
+- Condition #3 = LG 1mM, HG 10mM
+
+Perifusion:
+- Exclude KCl for donors: R361, R362, R385, R391 (already removed from final excel)
+- Only use basal LG (exclude the rest of perifusion curve) for donors: R419, R421 (already removed from final excel)
+
+Exclusion criteria
+- Remove any analyte with >50% donors below LOD
+- Remove any analyte with >40% of donors with NDR flag
+
+# Packages
+
+```{r packages}
+library(tidyverse)    # contains ggplot2, purrr, etc.
+library(readxl)
+library(janitor)      # for data cleaning
+library(scico)        # colour palettes
+library(ggsci)        # colour palettes
+library(ggpubr)       # for scatterplot correlations
+library(psychometric) # masks "select" from dplyr; for CIr()
+library(reshape2)     # for reshaping data for heatmaps
+library(knitr)
+library(pheatmap)
+library(corrplot)
+library(psych)
+library(lme4)
+library(here)
+```
+
+# Load necessary functions
+
+```{r}
+source(here::here("functions", "correlation_functions.R")) # General correlation functions
+source(here::here("functions", "plotting_functions.R"))    # Plotting functions
+source(here::here("functions", "percent_change.R"))        # Calculate percent change (sensitivity analyses)
+source(here::here("functions", "correlations_gsis.R"))     # Correlate analyte concentrations with different GSIS parameters
+```
+
+# Load data
+
+```{r}
+# load chemical list
+chem_list <- read_csv(here::here("data", "2022-10-18_AXYS_chemicals_list_AC.csv")) %>%
+  dplyr::select(Compound, Dioxin_subtype) %>%
+  mutate(across(where(is.character), str_squish))
+
+chem_list_2 <- read_csv(here::here("data", "2024-10-01_AXYS_chemicals_list_with_coelutions.csv")) %>%
+  dplyr::select(-c(Dioxin_subtype, Type)) %>%
+  mutate(across(where(is.character), str_squish))
+
+# load AXYS data
+axys_pops <- read_csv(here::here("outputs", "2024-08-24_ProjectGrant_excluded_outliers_for_single_analyte_analyses.csv")) %>%
+  dplyr::select(-c(CONC_BLANK_adj, IS_BLANK_ADJ_CONC_HIGHER_THAN_LOD)) %>%
+  mutate(BLANK_and_LOD_adj = as.numeric(BLANK_and_LOD_adj),
+         File = factor(File),
+         COMPOUND = case_when(str_detect(COMPOUND, "TOTAL") ~ str_to_sentence(COMPOUND),
+                              str_detect(COMPOUND, " Epoxide") ~ str_to_sentence(COMPOUND),
+                              TRUE ~ COMPOUND),
+         across(where(is.character), str_squish))
+
+axys_pops_2 <- axys_pops %>%
+  dplyr::select(-c(File, LAB_FLAG, DETECTION_LIMIT)) %>%
+  mutate(across(where(is.character), str_squish))
+
+# load AXYS data with imputed values for true NAs (chemicals not measured by AXYS in certain donors)
+axys_pops_imputed_panc <- read_excel(here::here("outputs", "2024-09-03_axys_pops_includes_imputed_values_for_true_NAs_using_mice_package.xlsx"), sheet = 1) %>%
+  mutate(across(where(is.character), str_squish))
+
+axys_pops_imputed_adip <- read_excel(here::here("outputs", "2024-09-03_axys_pops_includes_imputed_values_for_true_NAs_using_mice_package.xlsx"),sheet = 2) %>%
+  mutate(across(where(is.character), str_squish))
+
+# load AXYS donor metadata
+axys_metadata <- read_csv(here::here("data", "2024-08-22_donor_characteristics_FINAL.csv"),show_col_types = FALSE) %>%
+  mutate(BMI_category = case_when(BMI < 24.9 ~ "Lean",
+                                  BMI >= 24.9 & BMI <= 29.9 ~ "Overweight",
+                                  BMI > 29.9 ~ "Obese"),
+         Hba1c_category = case_when(Hba1c < 6 ~ "Normoglycemic",
+                                    Hba1c <= 6.5 ~ "Prediabetic",
+                                    Hba1c > 6.5 ~ "Diabetic"),
+         BMI_category = factor(BMI_category, levels = c("Lean", "Overweight", "Obese")),
+         Hba1c_category = factor(Hba1c_category, levels = c("Normoglycemic", "Prediabetic", "Diabetic")),
+         Sex = as_factor(Sex),
+         Diabetes_status = as_factor(Diabetes_status)) %>%
+  dplyr::select(-Purity)
+
+# Subset data by sex
+axys_females <- axys_metadata %>%
+  dplyr::filter(Sex == "F") %>%
+  dplyr::pull(Id)
+
+axys_males <- axys_metadata %>%
+  dplyr::filter(Sex == "M") %>%
+  dplyr::pull(Id)
+
+# Donor IDs
+axys_donors <- axys_metadata %>%
+  dplyr::select(Id)
+
+# Subset data by tissue type
+subset_tissue <- function(tissue) {
+  axys_pops_2 %>%
+    dplyr::filter(!str_detect(COMPOUND, "Total"), TISSUE_TYPE == tissue) %>%
+    dplyr::select(DONOR, COMPOUND, BLANK_and_LOD_adj) %>%
+    group_by(DONOR) %>%
+    pivot_wider(names_from = COMPOUND, values_from = BLANK_and_LOD_adj) %>%
+    ungroup()
+}
+
+axys_pops_panc <- subset_tissue("Pancreas")
+axys_pops_adip <- subset_tissue("Adipose")
+```
+## Calculate analyte sums by class
+
+```{r}
+# Create compounds list by class
+dioxin_list <- chem_list_2 %>%
+  dplyr::filter(Dioxin_similarity == "Dioxin") %>%
+  dplyr::pull(Compound)
+
+pcb_list <- chem_list_2 %>%
+  dplyr::filter(Dioxin_similarity == "DL" | Dioxin_similarity == "NDL") %>%
+  dplyr::pull(Compound)
+
+ocp_list <- chem_list_2 %>%
+  dplyr::filter(Dioxin_similarity == "OCP") %>%
+  dplyr::pull(Compound)
+```
+
+I calculated analyte sums using both the unimputed and imputed datasets for sensitivity analyses. 
+
+```{r}
+# Calculate sums for pancreas POPs
+axys_panc_sum <- axys_pops_panc %>%
+  pivot_longer(cols = c(2:34),
+               names_to = "COMPOUND",
+               values_to = "ADJ_CONC") %>%
+  left_join(., chem_list_2, by = c("COMPOUND" = "Compound")) %>%
+  group_by(DONOR, Dioxin_similarity) %>%
+  mutate(AnalyteSums = sum(ADJ_CONC, na.rm = TRUE)) %>%
+  ungroup() %>%
+  group_by(DONOR, Dioxin_similarity, AnalyteSums) %>%
+  summarise() %>%
+  pivot_wider(names_from = Dioxin_similarity, values_from = AnalyteSums) %>%
+  mutate(PCB = rowSums(across(c("DL", "NDL")))) %>%
+  dplyr::select(-OCP) %>%
+  relocate(DONOR, Dioxin, PCB) %>%
+  ungroup()
+
+# Calculate pancreas PCB sum without PCB77
+axys_panc_no_pcb77 <- axys_pops_panc %>%
+  pivot_longer(cols = c(2:34),
+               names_to = "COMPOUND",
+               values_to = "ADJ_CONC") %>%
+  left_join(., chem_list_2, by = c("COMPOUND" = "Compound")) %>%
+  dplyr::filter(Dioxin_similarity == "DL", COMPOUND != "PCB 77") %>%
+  dplyr::select(DONOR, COMPOUND, ADJ_CONC) %>%
+  group_by(DONOR) %>%
+  mutate(DL_no77 = sum(ADJ_CONC, na.rm = TRUE)) %>%
+  ungroup() %>%
+  group_by(DONOR, DL_no77) %>%
+  summarise()
+
+# Combine pancreas PCB sums without PCB77 with the rest of the sum data
+axys_panc_sums <- axys_panc_sum %>%
+  left_join(., axys_panc_no_pcb77, by = c("DONOR" = "DONOR"))
+```
+
+```{r}
+# Calculate sums for adipose POPs
+axys_adip_sum <- axys_pops_adip %>%
+  pivot_longer(cols = c(2:42),
+               names_to = "COMPOUND",
+               values_to = "ADJ_CONC") %>%
+  left_join(., chem_list_2, by = c("COMPOUND" = "Compound")) %>%
+  group_by(DONOR, Dioxin_similarity) %>%
+  mutate(AnalyteSums = sum(ADJ_CONC, na.rm = TRUE)) %>%
+  ungroup() %>%
+  group_by(DONOR, Dioxin_similarity, AnalyteSums) %>%
+  summarise() %>%
+  pivot_wider(names_from = Dioxin_similarity, values_from = AnalyteSums) %>%
+  mutate(PCB = rowSums(across(c("DL", "NDL")))) %>%
+  dplyr::select(-OCP) %>%
+  relocate(DONOR, Dioxin, PCB) %>%
+  ungroup()
+
+# Calculate adipose PCB sum without PCB77
+axys_adip_no_pcb77 <- axys_pops_adip %>%
+  pivot_longer(cols = c(2:42),
+               names_to = "COMPOUND",
+               values_to = "ADJ_CONC") %>%
+  left_join(., chem_list_2, by = c("COMPOUND" = "Compound")) %>%
+  dplyr::filter(Dioxin_similarity == "DL", COMPOUND != "PCB 77") %>%
+  dplyr::select(DONOR, COMPOUND, ADJ_CONC) %>%
+  group_by(DONOR) %>%
+  mutate(DL_no77 = sum(ADJ_CONC, na.rm = TRUE)) %>%
+  ungroup() %>%
+  group_by(DONOR, DL_no77) %>%
+  summarise()
+
+# Combine adipose PCB sums without PCB77 with the rest of the sum data
+axys_adip_sums <- axys_adip_sum %>%
+  left_join(., axys_adip_no_pcb77, by = c("DONOR" = "DONOR"))
+```
+
+```{r}
+# Calculate sums for pancreas POPs using imputed data
+axys_panc_imputed_sum <- axys_pops_imputed_panc %>%
+  pivot_longer(cols = c(2:34),
+               names_to = "COMPOUND",
+               values_to = "ADJ_CONC") %>%
+  left_join(., chem_list_2, by = c("COMPOUND" = "Compound")) %>%
+  group_by(DONOR, Dioxin_similarity) %>%
+  mutate(AnalyteSums = sum(ADJ_CONC)) %>%
+  ungroup() %>%
+  group_by(DONOR, Dioxin_similarity, AnalyteSums) %>%
+  summarise() %>%
+  pivot_wider(names_from = Dioxin_similarity, values_from = AnalyteSums) %>%
+  mutate(PCB = rowSums(across(c("DL", "NDL")))) %>%
+  dplyr::select(-OCP) %>%
+  relocate(DONOR, Dioxin, PCB) %>%
+  ungroup()
+
+# Calculate pancreas PCB sum without PCB77 (imputed data)
+axys_panc_no_pcb77_imputed <- axys_pops_imputed_panc %>%
+  pivot_longer(cols = c(2:34),
+               names_to = "COMPOUND",
+               values_to = "ADJ_CONC") %>%
+  left_join(., chem_list_2, by = c("COMPOUND" = "Compound")) %>%
+  dplyr::filter(Dioxin_similarity == "DL", COMPOUND != "PCB 77") %>%
+  dplyr::select(DONOR, COMPOUND, ADJ_CONC) %>%
+  group_by(DONOR) %>%
+  mutate(DL_no77 = sum(ADJ_CONC, na.rm = TRUE)) %>%
+  ungroup() %>%
+  group_by(DONOR, DL_no77) %>%
+  summarise()
+
+# Combine pancreas PCB sums without PCB77 with the rest of the sum data (imputed data)
+axys_panc_imputed_sums <- axys_panc_imputed_sum %>%
+  left_join(., axys_panc_no_pcb77_imputed, by = c("DONOR" = "DONOR"))
+```
+
+```{r}
+# Calculate sums for adipose POPs using imputed data
+axys_adip_imputed_sum <- axys_pops_imputed_adip %>%
+  pivot_longer(cols = c(2:42),
+               names_to = "COMPOUND",
+               values_to = "ADJ_CONC") %>%
+  left_join(., chem_list_2, by = c("COMPOUND" = "Compound")) %>%
+  group_by(DONOR, Dioxin_similarity) %>%
+  mutate(AnalyteSums = sum(ADJ_CONC)) %>%
+  ungroup() %>%
+  group_by(DONOR, Dioxin_similarity, AnalyteSums) %>%
+  summarise() %>%
+  pivot_wider(names_from = Dioxin_similarity, values_from = AnalyteSums) %>%
+  mutate(PCB = rowSums(across(c("DL", "NDL")))) %>%
+  dplyr::select(-OCP) %>%
+  relocate(DONOR, Dioxin, PCB) %>%
+  ungroup()
+
+# Calculate adipose PCB sum without PCB77 (imputed)
+axys_adip_no_pcb77_imputed <- axys_pops_imputed_adip %>%
+  pivot_longer(cols = c(2:42),
+               names_to = "COMPOUND",
+               values_to = "ADJ_CONC") %>%
+  left_join(., chem_list_2, by = c("COMPOUND" = "Compound")) %>%
+  dplyr::filter(Dioxin_similarity == "DL", COMPOUND != "PCB 77") %>%
+  dplyr::select(DONOR, COMPOUND, ADJ_CONC) %>%
+  group_by(DONOR) %>%
+  mutate(DL_no77 = sum(ADJ_CONC, na.rm = TRUE)) %>%
+  ungroup() %>%
+  group_by(DONOR, DL_no77) %>%
+  summarise()
+
+# Combine pancreas PCB sums without PCB77 with the rest of the sum data (imputed data)
+axys_adip_imputed_sums <- axys_adip_imputed_sum %>%
+  left_join(., axys_adip_no_pcb77_imputed, by = c("DONOR" = "DONOR"))
+```
+
+```{r}
+# Combine single analyte concentrations with sums
+
+# Data without imputations
+axys_pops_with_sums_panc <- axys_pops_panc %>%
+  left_join(., axys_panc_sums, by = c("DONOR" = "DONOR"))
+
+axys_pops_with_sums_adip <- axys_pops_adip %>%
+  left_join(., axys_adip_sums, by = c("DONOR" = "DONOR"))
+
+# Imputed data
+axys_pops_with_sums_panc_imputed <- axys_pops_imputed_panc %>%
+  left_join(., axys_panc_imputed_sums, by = c("DONOR" = "DONOR"))
+
+axys_pops_with_sums_adip_imputed <- axys_pops_imputed_adip %>%
+  left_join(., axys_adip_imputed_sums, by = c("DONOR" = "DONOR"))
+```
+
+```{r}
+# Combine analyte concentrations with metadata
+axys_pops_with_sums_panc_meta <- axys_pops_with_sums_panc %>%
+  left_join(., axys_metadata, by = c("DONOR" = "Id")) %>%
+  dplyr::select(-Hba1c_category)
+
+axys_pops_with_sums_adip_meta <- axys_pops_with_sums_adip %>%
+  left_join(., axys_metadata, by = c("DONOR" = "Id")) %>%
+  dplyr::select(-Hba1c_category)
+
+axys_pops_with_sums_panc_imputed_meta <- axys_pops_with_sums_panc_imputed %>%
+  left_join(., axys_metadata, by = c("DONOR" = "Id")) %>%
+  dplyr::select(-Hba1c_category)
+
+axys_pops_with_sums_adip_imputed_meta <- axys_pops_with_sums_adip_imputed %>%
+  left_join(., axys_metadata, by = c("DONOR" = "Id")) %>%
+  dplyr::select(-Hba1c_category)
+```
+
+# Sensitivity analyses
+
+For sensitivity analyses, I am comparing the correlation coefficients from the original dataset with correlation coefficients after the following adjustments: (1) imputing missing pollutant concentration values, or (2) removing one or more influential donors. Influential donors were donors that did not cluster with the rest of the donor population in PCA analyses.
+
+```{r}
+# Remove outlier donors
+rm_ind_adip <- c("R419", "R421")
+rm_ind_panc <- c("R389", "R419", "R448")
+```
+
+## Create a dataframe for pollutant concentration data by tissue type and pollutant class
+
+I generated a separate dataframe of pollutant concentration data by pollutant class for each tissue. I made 5 to 6 dataframes per pollutant class per tissue: (1) unadjusted data (i.e., no imputations, no donors excluded), (2) data with imputed missing values: "_imp", (3) data with all outliers removed: "_panc_rm_ind" or "_adip_rm_id", (4) data with one influential donor removed at a time. There were 3 influential donors in pancreas ("_rm_R389", "_rm_R419", or "_rm_R448") and 2 influential donors in adipose ("_rm_R419" or "_rm_R421").
+
+### Dioxins: Pancreas
+
+```{r}
+# All donors
+axys_pops_panc_dioxin_meta <- axys_pops_with_sums_panc_meta %>%
+  dplyr::select(DONOR, any_of(dioxin_list), Dioxin, Age, BMI, Hba1c)
+
+# Separated by sex
+axys_pops_panc_dioxin_meta_F <- axys_pops_with_sums_panc_meta %>%
+  dplyr::filter(DONOR %in% axys_females) %>%
+  dplyr::select(DONOR, any_of(dioxin_list), Dioxin, Age, BMI, Hba1c)
+
+axys_pops_panc_dioxin_meta_M <- axys_pops_with_sums_panc_meta %>%
+  dplyr::filter(DONOR %in% axys_males) %>%
+  dplyr::select(DONOR, any_of(dioxin_list), Dioxin, Age, BMI, Hba1c)
+
+# All donors with imputed values or donors removed
+axys_pops_panc_dioxin_imputed_meta <- axys_pops_with_sums_panc_imputed_meta %>%
+  dplyr::select(DONOR, any_of(dioxin_list), Dioxin, Age, BMI, Hba1c)
+
+axys_pops_panc_rm_ind_dioxin_meta <- axys_pops_with_sums_panc_meta %>%
+  dplyr::filter(!(DONOR %in% rm_ind_panc)) %>%
+  dplyr::select(DONOR, any_of(dioxin_list), Dioxin, Age, BMI, Hba1c)
+
+axys_pops_panc_rm_389_dioxin_meta <- axys_pops_with_sums_panc_meta %>%
+  dplyr::filter(DONOR != "R389") %>%
+  dplyr::select(DONOR, any_of(dioxin_list), Dioxin, Age, BMI, Hba1c)
+
+axys_pops_panc_rm_419_dioxin_meta <- axys_pops_with_sums_panc_meta %>%
+  dplyr::filter(DONOR != "R419") %>%
+  dplyr::select(DONOR, any_of(dioxin_list), Dioxin, Age, BMI, Hba1c)
+
+axys_pops_panc_rm_448_dioxin_meta <- axys_pops_with_sums_panc_meta %>%
+  dplyr::filter(DONOR != "R448") %>%
+  dplyr::select(DONOR, any_of(dioxin_list), Dioxin, Age, BMI, Hba1c)
+```
+
+### Dioxins: Adipose
+
+```{r}
+# All donors
+axys_pops_adip_dioxin_meta <- axys_pops_with_sums_adip_meta %>%
+  dplyr::select(DONOR, any_of(dioxin_list), Dioxin, Age, BMI, Hba1c)
+
+# Separated by sex
+axys_pops_adip_dioxin_meta_F <- axys_pops_with_sums_adip_meta %>%
+  dplyr::filter(DONOR %in% axys_females) %>%
+  dplyr::select(DONOR, any_of(dioxin_list), Dioxin, Age, BMI, Hba1c)
+
+axys_pops_adip_dioxin_meta_M <- axys_pops_with_sums_adip_meta %>%
+  dplyr::filter(DONOR %in% axys_males) %>%
+  dplyr::select(DONOR, any_of(dioxin_list), Dioxin, Age, BMI, Hba1c)
+
+# All donors with imputed values or donors removed
+axys_pops_adip_dioxin_imputed_meta <- axys_pops_with_sums_adip_imputed_meta %>%
+  dplyr::select(DONOR, any_of(dioxin_list), Dioxin, Age, BMI, Hba1c)
+
+axys_pops_adip_rm_ind_dioxin_meta <- axys_pops_with_sums_adip_meta %>%
+  dplyr::filter(!(DONOR %in% rm_ind_adip)) %>%
+  dplyr::select(DONOR, any_of(dioxin_list), Dioxin, Age, BMI, Hba1c)
+
+axys_pops_adip_rm_419_dioxin_meta <- axys_pops_with_sums_adip_meta %>%
+  dplyr::filter(DONOR != "R419") %>%
+  dplyr::select(DONOR, any_of(dioxin_list), Dioxin, Age, BMI, Hba1c)
+
+axys_pops_adip_rm_421_dioxin_meta <- axys_pops_with_sums_adip_meta %>%
+  dplyr::filter(DONOR != "R421") %>%
+  dplyr::select(DONOR, any_of(dioxin_list), Dioxin, Age, BMI, Hba1c)
+```
+
+### PCBs: Pancreas
+
+```{r}
+# All donors
+axys_pops_panc_pcb_meta <- axys_pops_with_sums_panc_meta %>%
+  dplyr::select(DONOR, any_of(pcb_list), PCB, DL, NDL, DL_no77, Age, BMI, Hba1c)
+
+# Separated by sex
+axys_pops_panc_pcb_meta_F <- axys_pops_with_sums_panc_meta %>%
+  dplyr::filter(DONOR %in% axys_females) %>%
+  dplyr::select(DONOR, any_of(pcb_list), PCB, DL, NDL, DL_no77, Age, BMI, Hba1c)
+
+axys_pops_panc_pcb_meta_M <- axys_pops_with_sums_panc_meta %>%
+  dplyr::filter(DONOR %in% axys_males) %>%
+  dplyr::select(DONOR, any_of(pcb_list), PCB, DL, NDL, DL_no77, Age, BMI, Hba1c)
+
+# All donors with imputed values or donors removed
+axys_pops_panc_pcb_imputed_meta <- axys_pops_with_sums_panc_imputed_meta %>%
+  dplyr::select(DONOR, any_of(pcb_list), PCB, DL, NDL, DL_no77, Age, BMI, Hba1c)
+
+axys_pops_panc_rm_ind_pcb_meta <- axys_pops_with_sums_panc_meta %>%
+  dplyr::filter(!(DONOR %in% rm_ind_panc)) %>%
+  dplyr::select(DONOR, any_of(pcb_list), PCB, DL, NDL, DL_no77, Age, BMI, Hba1c)
+
+axys_pops_panc_rm_389_pcb_meta <- axys_pops_with_sums_panc_meta %>%
+  dplyr::filter(DONOR != "R389") %>%
+  dplyr::select(DONOR, any_of(pcb_list), PCB, DL, NDL, DL_no77, Age, BMI, Hba1c)
+
+axys_pops_panc_rm_419_pcb_meta <- axys_pops_with_sums_panc_meta %>%
+  dplyr::filter(DONOR != "R419") %>%
+  dplyr::select(DONOR, any_of(pcb_list), PCB, DL, NDL, DL_no77, Age, BMI, Hba1c)
+
+axys_pops_panc_rm_448_pcb_meta <- axys_pops_with_sums_panc_meta %>%
+  dplyr::filter(DONOR != "R448") %>%
+  dplyr::select(DONOR, any_of(pcb_list), PCB, DL, NDL, DL_no77, Age, BMI, Hba1c)
+```
+
+### PCBs: Adipose
+
+```{r}
+# All donors
+axys_pops_adip_pcb_meta <- axys_pops_with_sums_adip_meta %>%
+  dplyr::select(DONOR, any_of(pcb_list), PCB, DL, NDL, DL_no77, Age, BMI, Hba1c)
+
+# Separated by sex
+axys_pops_adip_pcb_meta_F <- axys_pops_with_sums_adip_meta %>%
+  dplyr::filter(DONOR %in% axys_females) %>%
+  dplyr::select(DONOR, any_of(pcb_list), PCB, DL, NDL, DL_no77, Age, BMI, Hba1c)
+
+axys_pops_adip_pcb_meta_M <- axys_pops_with_sums_adip_meta %>%
+  dplyr::filter(DONOR %in% axys_males) %>%
+  dplyr::select(DONOR, any_of(pcb_list), PCB, DL, NDL, DL_no77, Age, BMI, Hba1c)
+
+# All donors with imputed values or donors removed
+axys_pops_adip_pcb_imputed_meta <- axys_pops_with_sums_adip_imputed_meta %>%
+  dplyr::select(DONOR, any_of(pcb_list), PCB, DL, NDL, DL_no77, Age, BMI, Hba1c)
+
+axys_pops_adip_rm_ind_pcb_meta <- axys_pops_with_sums_adip_meta %>%
+  dplyr::filter(!(DONOR %in% rm_ind_adip)) %>%
+  dplyr::select(DONOR, any_of(pcb_list), PCB, DL, NDL, DL_no77, Age, BMI, Hba1c)
+
+axys_pops_adip_rm_419_pcb_meta <- axys_pops_with_sums_adip_meta %>%
+  dplyr::filter(DONOR != "R419") %>%
+  dplyr::select(DONOR, any_of(pcb_list), PCB, DL, NDL, DL_no77, Age, BMI, Hba1c)
+
+axys_pops_adip_rm_421_pcb_meta <- axys_pops_with_sums_adip_meta %>%
+  dplyr::filter(DONOR != "R421") %>%
+  dplyr::select(DONOR, any_of(pcb_list), PCB, DL, NDL, DL_no77, Age, BMI, Hba1c)
+```
+
+### OCPs: Pancreas
+
+```{r}
+# All donors
+axys_pops_panc_ocp_meta <- axys_pops_with_sums_panc_meta %>%
+  dplyr::select(DONOR, any_of(ocp_list), Age, BMI, Hba1c)
+
+# Separated by sex
+axys_pops_panc_ocp_meta_F <- axys_pops_with_sums_panc_meta %>%
+  dplyr::filter(DONOR %in% axys_females) %>%
+  dplyr::select(DONOR, any_of(ocp_list), Age, BMI, Hba1c)
+
+axys_pops_panc_ocp_meta_M <- axys_pops_with_sums_panc_meta %>%
+  dplyr::filter(DONOR %in% axys_males) %>%
+  dplyr::select(DONOR, any_of(ocp_list), Age, BMI, Hba1c)
+
+# All donors with imputed values or donors removed
+axys_pops_panc_ocp_imputed_meta <- axys_pops_with_sums_panc_imputed_meta %>%
+  dplyr::select(DONOR, any_of(ocp_list), Age, BMI, Hba1c)
+
+axys_pops_panc_rm_ind_ocp_meta <- axys_pops_with_sums_panc_meta %>%
+  dplyr::filter(!(DONOR %in% rm_ind_panc)) %>%
+  dplyr::select(DONOR, any_of(ocp_list), Age, BMI, Hba1c)
+
+axys_pops_panc_rm_389_ocp_meta <- axys_pops_with_sums_panc_meta %>%
+  dplyr::filter(DONOR != "R389") %>%
+  dplyr::select(DONOR, any_of(ocp_list), Age, BMI, Hba1c)
+
+axys_pops_panc_rm_419_ocp_meta <- axys_pops_with_sums_panc_meta %>%
+  dplyr::filter(DONOR != "R419") %>%
+  dplyr::select(DONOR, any_of(ocp_list), Age, BMI, Hba1c)
+
+axys_pops_panc_rm_448_ocp_meta <- axys_pops_with_sums_panc_meta %>%
+  dplyr::filter(DONOR != "R448") %>%
+  dplyr::select(DONOR, any_of(ocp_list), Age, BMI, Hba1c)
+```
+
+### OCPs: Adipose
+
+```{r}
+# All donors
+axys_pops_adip_ocp_meta <- axys_pops_with_sums_adip_meta %>%
+  dplyr::select(DONOR, any_of(ocp_list), Age, BMI, Hba1c)
+
+# Separated by sex
+axys_pops_adip_ocp_meta_F <- axys_pops_with_sums_adip_meta %>%
+  dplyr::filter(DONOR %in% axys_females) %>%
+  dplyr::select(DONOR, any_of(ocp_list), Age, BMI, Hba1c)
+
+axys_pops_adip_ocp_meta_M <- axys_pops_with_sums_adip_meta %>%
+  dplyr::filter(DONOR %in% axys_males) %>%
+  dplyr::select(DONOR, any_of(ocp_list), Age, BMI, Hba1c)
+
+# All donors with imputed values or donors removed
+axys_pops_adip_ocp_imputed_meta <- axys_pops_with_sums_adip_imputed_meta %>%
+  dplyr::select(DONOR, any_of(ocp_list), Age, BMI, Hba1c)
+
+axys_pops_adip_rm_ind_ocp_meta <- axys_pops_with_sums_adip_meta %>%
+  dplyr::filter(!(DONOR %in% rm_ind_adip)) %>%
+  dplyr::select(DONOR, any_of(ocp_list), Age, BMI, Hba1c)
+
+axys_pops_adip_rm_419_ocp_meta <- axys_pops_with_sums_adip_meta %>%
+  dplyr::filter(DONOR != "R419") %>%
+  dplyr::select(DONOR, any_of(ocp_list), Age, BMI, Hba1c)
+
+axys_pops_adip_rm_421_ocp_meta <- axys_pops_with_sums_adip_meta %>%
+  dplyr::filter(DONOR != "R421") %>%
+  dplyr::select(DONOR, any_of(ocp_list), Age, BMI, Hba1c)
+```
+
+# Correlate metadata with individual analyte concentrations and analyte sums: Kendall
+
+## Create lists of concentration matrices for each tissue/POP subgroup
+
+### Pancreas
+
+```{r}
+axys_analytes_list_panc_meta <- list(
+  axys_pops_panc_dioxin_meta = axys_pops_panc_dioxin_meta,
+  axys_pops_panc_pcb_meta = axys_pops_panc_pcb_meta,
+  axys_pops_panc_ocp_meta = axys_pops_panc_ocp_meta
+)
+
+axys_analytes_list_panc_meta_F <- list(
+  axys_pops_panc_dioxin_meta_F = axys_pops_panc_dioxin_meta_F,
+  axys_pops_panc_pcb_meta_F = axys_pops_panc_pcb_meta_F,
+  axys_pops_panc_ocp_meta_F = axys_pops_panc_ocp_meta_F
+)
+
+axys_analytes_list_panc_meta_M <- list(
+  axys_pops_panc_dioxin_meta_M = axys_pops_panc_dioxin_meta_M,
+  axys_pops_panc_pcb_meta_M = axys_pops_panc_pcb_meta_M,
+  axys_pops_panc_ocp_meta_M = axys_pops_panc_ocp_meta_M
+)
+
+axys_analytes_list_panc_imputed_meta <- list(
+  axys_pops_panc_dioxin_imputed_meta = axys_pops_panc_dioxin_imputed_meta,
+  axys_pops_panc_pcb_imputed_meta = axys_pops_panc_pcb_imputed_meta,
+  axys_pops_panc_ocp_imputed_meta = axys_pops_panc_ocp_imputed_meta
+)
+
+axys_analytes_list_panc_rm_ind_meta <- list(
+  axys_pops_panc_rm_ind_dioxin_meta = axys_pops_panc_rm_ind_dioxin_meta,
+  axys_pops_panc_rm_ind_pcb_meta = axys_pops_panc_rm_ind_pcb_meta,
+  axys_pops_panc_rm_ind_ocp_meta = axys_pops_panc_rm_ind_ocp_meta
+)
+
+axys_analytes_list_panc_rm_389_meta <- list(
+  axys_pops_panc_rm_389_dioxin_meta = axys_pops_panc_rm_389_dioxin_meta,
+  axys_pops_panc_rm_389_pcb_meta = axys_pops_panc_rm_389_pcb_meta,
+  axys_pops_panc_rm_389_ocp_meta = axys_pops_panc_rm_389_ocp_meta
+)
+
+axys_analytes_list_panc_rm_419_meta <- list(
+  axys_pops_panc_rm_419_dioxin_meta = axys_pops_panc_rm_419_dioxin_meta,
+  axys_pops_panc_rm_419_pcb_meta = axys_pops_panc_rm_419_pcb_meta,
+  axys_pops_panc_rm_419_ocp_meta = axys_pops_panc_rm_419_ocp_meta
+)
+
+axys_analytes_list_panc_rm_448_meta <- list(
+  axys_pops_panc_rm_448_dioxin_meta = axys_pops_panc_rm_448_dioxin_meta,
+  axys_pops_panc_rm_448_pcb_meta = axys_pops_panc_rm_448_pcb_meta,
+  axys_pops_panc_rm_448_ocp_meta = axys_pops_panc_rm_448_ocp_meta
+)
+```
+
+### Adipose
+
+```{r}
+axys_analytes_list_adip_meta <- list(
+  axys_pops_adip_dioxin_meta = axys_pops_adip_dioxin_meta,
+  axys_pops_adip_pcb_meta = axys_pops_adip_pcb_meta,
+  axys_pops_adip_ocp_meta = axys_pops_adip_ocp_meta
+)
+
+axys_analytes_list_adip_meta_F <- list(
+  axys_pops_adip_dioxin_meta_F = axys_pops_adip_dioxin_meta_F,
+  axys_pops_adip_pcb_meta_F = axys_pops_adip_pcb_meta_F,
+  axys_pops_adip_ocp_meta_F = axys_pops_adip_ocp_meta_F
+)
+
+axys_analytes_list_adip_meta_M <- list(
+  axys_pops_adip_dioxin_meta_M = axys_pops_adip_dioxin_meta_M,
+  axys_pops_adip_pcb_meta_M = axys_pops_adip_pcb_meta_M,
+  axys_pops_adip_ocp_meta_M = axys_pops_adip_ocp_meta_M
+)
+
+axys_analytes_list_adip_imputed_meta <- list(
+  axys_pops_adip_dioxin_imputed_meta = axys_pops_adip_dioxin_imputed_meta,
+  axys_pops_adip_pcb_imputed_meta = axys_pops_adip_pcb_imputed_meta,
+  axys_pops_adip_ocp_imputed_meta = axys_pops_adip_ocp_imputed_meta
+)
+
+axys_analytes_list_adip_rm_ind_meta <- list(
+  axys_pops_adip_rm_ind_dioxin_meta = axys_pops_adip_rm_ind_dioxin_meta,
+  axys_pops_adip_rm_ind_pcb_meta = axys_pops_adip_rm_ind_pcb_meta,
+  axys_pops_adip_rm_ind_ocp_meta = axys_pops_adip_rm_ind_ocp_meta
+)
+
+axys_analytes_list_adip_rm_419_meta <- list(
+  axys_pops_adip_rm_419_dioxin_meta = axys_pops_adip_rm_419_dioxin_meta,
+  axys_pops_adip_rm_419_pcb_meta = axys_pops_adip_rm_419_pcb_meta,
+  axys_pops_adip_rm_419_ocp_meta = axys_pops_adip_rm_419_ocp_meta
+)
+
+axys_analytes_list_adip_rm_421_meta <- list(
+  axys_pops_adip_rm_421_dioxin_meta = axys_pops_adip_rm_421_dioxin_meta,
+  axys_pops_adip_rm_421_pcb_meta = axys_pops_adip_rm_421_pcb_meta,
+  axys_pops_adip_rm_421_ocp_meta = axys_pops_adip_rm_421_ocp_meta
+) 
+```
+
+```{r}
+axys_analytes_all <- list(
+  # Pancreas
+  panc_orig       = axys_analytes_list_panc_meta,
+  panc_F          = axys_analytes_list_panc_meta_F,
+  panc_M          = axys_analytes_list_panc_meta_M,
+  panc_imputed    = axys_analytes_list_panc_imputed_meta,
+  panc_rm_ind     = axys_analytes_list_panc_rm_ind_meta,
+  panc_rm_389     = axys_analytes_list_panc_rm_389_meta,
+  panc_rm_419     = axys_analytes_list_panc_rm_419_meta,
+  panc_rm_448     = axys_analytes_list_panc_rm_448_meta,
+  
+  # Adipose
+  adip_orig       = axys_analytes_list_adip_meta,
+  adip_F          = axys_analytes_list_adip_meta_F,
+  adip_M          = axys_analytes_list_adip_meta_M,
+  adip_imputed    = axys_analytes_list_adip_imputed_meta,
+  adip_rm_ind     = axys_analytes_list_adip_rm_ind_meta,
+  adip_rm_419     = axys_analytes_list_adip_rm_419_meta,
+  adip_rm_421     = axys_analytes_list_adip_rm_421_meta
+)
+
+corr_results_ci <- purrr::map(axys_analytes_all, ~ apply_r(.x, output = "ci"))
+corr_results_upper <- purrr::map(axys_analytes_all, ~ apply_r(.x, output = "upper"))
+
+# save_correlation_matrices(corr_results_ci, write_metadata = FALSE)
+# save_correlation_matrices(corr_results_upper, write_metadata = FALSE)
+```
+
+## Perform Kendall correlations
+
+```{r, fig.width = 8}
+# Perform kendall correlations for all combinations of axys analytes vs analytes
+axys_analytes_all_corr <- imap(axys_analytes_all, ~ map(.x, cor.mtest))
+
+# Plot each correlation result
+walk(axys_analytes_all_corr, ~ plot_all_correlations(.x))
+
+# Export plots
+# imap(axys_analytes_all_corr, ~ plot_all_correlations(.x, file.path("corr_plots_pop_vs_meta", .y), width = 8, height = 6, res = 300))
+```
+
+## Calculate percent change in correlation coefficient
+
+```{r}
+# generate_rchange_lists(
+#   nested_corr_list = corr_results_ci[!names(corr_results_ci) %in% c("adip_F", "adip_M")],
+#   tissue = "adip",
+#   save_csv = TRUE,
+#   out_dir = paste0(Sys.Date(), "_pops_vs_metadata_rchange/adipose")
+# )
+# 
+# generate_rchange_lists(
+#   nested_corr_list = corr_results_ci[!names(corr_results_ci) %in% c("panc_F", "panc_M")],
+#   tissue = "panc",
+#   save_csv = TRUE,
+#   out_dir = paste0(Sys.Date(), "_pops_vs_metadata_rchange/pancreas")
+# )
+```
+
+# Session Info
+
+```{r}
+sessionInfo()
+```
