@@ -23,16 +23,16 @@ This repository contains the full R analysis pipeline used to examine how persis
 - **OCP**: Organochlorine pesticides
 
 ### File descriptions:
-1. **2025-08-05_AXYS_correlation_analyses_PCA.Rmd**  
-Principal component analyses (PCA) and identification of influential donors.
-3. **2025-05-22_AXYS_correlation_analyses_imputing_missing_values.Rmd**  
+1. **2025-05-22_AXYS_correlation_analyses_imputing_missing_values.Rmd**  
 Imputation of missing POP concentration values.
-3. **2025-07-30_AXYS_correlation_analyses_donor_characteristics.Rmd**  
-Correlations between POP concentrations and donor metadata.
-4. **2025-07-30_AXYS_correlation_analyses_GSIS_parameters.Rmd**  
-Correlations between POP concentrations and GSIS parameters.
-5. **2025-05-22_AXYS_sensitivity_analyses.Rmd**  
+2. **2025-05-22_AXYS_sensitivity_analyses.Rmd**  
 Sensitivity analyses comparing imputed vs. non-imputed datasets and inclusion vs. exclusion of influential donor(s).
+3. **2025-07-30_AXYS_correlation_analyses_GSIS_parameters.Rmd**  
+Correlations between POP concentrations and GSIS parameters.
+4. **2025-07-30_AXYS_correlation_analyses_donor_characteristics.Rmd**  
+Correlations between POP concentrations and donor metadata.
+5. **2025-08-05_AXYS_correlation_analyses_PCA.Rmd**  
+Principal component analyses (PCA) and identification of influential donors.
 6. **2025-08-25_AXYS_partial_correlations.Rmd**  
 Partial correlations adjusting for age and/or BMI.
 7. **2025-11-21_AXYS_correlation_analyses_inter-lab_variability.Rmd**  
