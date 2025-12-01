@@ -13,6 +13,7 @@ output:
 library(tidyverse)
 library(readxl)
 library(ggplot2)
+library(here)
 
 # For missing value imputation
 library(mice)         # for imputing missing values
@@ -24,11 +25,11 @@ library(lattice)
 
 ```{r}
 # load chemical list
-chem_list <- read_csv("../../../data/2022-10-18_AXYS_chemicals_list_AC.csv") %>%
+chem_list <- read_csv(here::here("data", "2022-10-18_AXYS_chemicals_list_AC.csv")) %>%
   dplyr::select(Compound, Dioxin_subtype)
 
 # load AXYS data
-axys_pops <- read_csv("../../../outputs/2024-08-24_ProjectGrant_excluded_outliers_for_single_analyte_analyses.csv") %>%
+axys_pops <- read_csv(here::here("outputs", "2024-08-24_ProjectGrant_excluded_outliers_for_single_analyte_analyses.csv")) %>%
   dplyr::select(-c(CONC_BLANK_adj, IS_BLANK_ADJ_CONC_HIGHER_THAN_LOD)) %>%
   mutate(BLANK_and_LOD_adj = as.numeric(BLANK_and_LOD_adj),
          File = factor(File),
