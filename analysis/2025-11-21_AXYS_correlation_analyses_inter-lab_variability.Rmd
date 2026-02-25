@@ -30,7 +30,7 @@ source(here::here("functions", "inter_lab_variability_helpers.R"))
 
 ```{r}
 # load AXYS donor metadata
-axys_metadata <- read_csv(here("data", "2024-08-22_donor_characteristics_FINAL.csv"), show_col_types = FALSE) %>%
+axys_metadata <- read_csv(here("data", "2024-08-22_donor_characteristics.csv"), show_col_types = FALSE) %>%
   mutate(BMI_category = case_when(BMI < 24.9 ~ "Lean",
                                   BMI >= 24.9 & BMI <= 29.9 ~ "Overweight",
                                   BMI > 29.9 ~ "Obese"),
@@ -50,7 +50,7 @@ axys_donors <- axys_metadata %>%
 
 ```{r}
 # load GSIS data from ADI
-gsis_adi_param <- read_excel(here("data", "Perifusion+GSIS", "2024-05-18_IsletCore_GSIS_from_TeamGrant_website.xlsx")) %>%
+gsis_adi_param <- read_excel(here("data", "2024-05-18_isletcore_static_gsis.xlsx")) %>%
   mutate(Cond = factor(Cond, levels = c("1", "2", "3")),
                 replicate = as.character(replicate))
 
@@ -76,7 +76,7 @@ gsis_adi_wide <- gsis_adi_ave %>%
 
 ```{r}
 # Load Myriam perifusion data
-glu_peri_mh <- read_excel(here("data", "Perifusion+GSIS", "2024-01-25_Perifusion_FINAL DATA_For analysis_AC.xlsx")) %>%
+glu_peri_mh <- read_excel(here("data", "2024-01-25_bruin_lab_glucose_perifusion.xlsx")) %>%
   mutate(PerifusionParam = str_c("MH", PerifusionParam, sep = "_"),
          .keep = c("unused")) %>% 
   mutate(across(3:ncol(.), as.numeric))
