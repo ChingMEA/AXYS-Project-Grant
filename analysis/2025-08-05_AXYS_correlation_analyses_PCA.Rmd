@@ -30,11 +30,11 @@ source(here::here("functions", "pca_functions.R"))
 
 ```{r AXYS_data}
 # load chemical list
-chem_list <- read_csv(here::here("data", "2022-10-18_AXYS_chemicals_list_AC.csv")) %>%
+chem_list <- read_csv(here::here("data", "2022-10-18_pops_analytes_list.csv")) %>%
   dplyr::select(Compound, Dioxin_subtype)
 
 # load AXYS data
-axys_pops <- read_csv(here::here("outputs", "2024-08-24_ProjectGrant_excluded_outliers_for_single_analyte_analyses.csv")) %>%
+axys_pops <- read_csv(here::here("data", "2024-08-24_pops_data_outliers_excluded_for_single_analyte_analyses.csv")) %>%
   dplyr::select(-c(CONC_BLANK_adj, IS_BLANK_ADJ_CONC_HIGHER_THAN_LOD)) %>%
   mutate(BLANK_and_LOD_adj = as.numeric(BLANK_and_LOD_adj),
          File = factor(File),
@@ -48,10 +48,10 @@ axys_pops_2 <- axys_pops %>%
   mutate(across(where(is.character), str_squish))
 
 # load AXYS sum data
-axys_sums <- read_csv(here::here("outputs", "2024-08-24_ProjectGrant_sums_per_donor_AC.csv"))
+axys_sums <- read_csv(here::here("data", "2024-08-24_pop_sums_per_donor.csv"))
 
 # load AXYS donor metadata
-axys_metadata <- read_csv(here::here("data", "2024-08-22_donor_characteristics_FINAL.csv"), show_col_types = FALSE) %>%
+axys_metadata <- read_csv(here::here("data", "2024-08-22_donor_characteristics.csv"), show_col_types = FALSE) %>%
   mutate(BMI_category = case_when(BMI < 24.9 ~ "Lean",
                                   BMI >= 24.9 & BMI <= 29.9 ~ "Overweight",
                                   BMI > 29.9 ~ "Obese"),
@@ -69,7 +69,7 @@ axys_donors <- axys_metadata %>%
   dplyr::select(Id)
 
 # Load islet processing details
-processing_info <- read_csv(here::here("data", "Perifusion+GSIS", "2025-07-25_team_grant_website_isolation_info.csv")) %>%
+processing_info <- read_csv(here::here("data", "2025-07-25_isolation_info.csv")) %>%
   dplyr::select(record_id, coldischemiatime, digesttime, puritypercentage, isletparticleindex) %>%
   dplyr::mutate(Donor = record_id,
                 .keep = c("unused")) %>%
@@ -99,7 +99,7 @@ axys_pops_adip <- subset_tissue("Adipose")
 
 ```{r}
 # load GSIS data from ADI
-gsis_adi_param <- read_excel(here::here("data", "Perifusion+GSIS", "2024-05-18_IsletCore_GSIS_from_TeamGrant_website.xlsx")) %>%
+gsis_adi_param <- read_excel(here::here("data", "2024-05-18_isletcore_static_gsis.xlsx")) %>%
   dplyr::mutate(Cond = factor(Cond, levels = c("1", "2", "3")),
                 replicate = as.character(replicate))
 
@@ -121,7 +121,7 @@ gsis_adi_wide <- gsis_adi_ave %>%
            InsulinContent_IsletCore_2, LG_IsletCore_2, HG_IsletCore_2, SI_IsletCore_2,
            InsulinContent_IsletCore_3, LG_IsletCore_3, HG_IsletCore_3, SI_IsletCore_3)
 
-gsis_adi_preInsCont <- read_csv(here::here("data", "Perifusion+GSIS", "2025-07-25_team_grant_website_isolation_info.csv")) %>%
+gsis_adi_preInsCont <- read_csv(here::here("data", "2025-07-25_team_grant_website_isolation_info.csv")) %>%
   dplyr::select("record_id", "insulincontent") %>%
   dplyr::mutate(PreInsulinContent_IsletCore = insulincontent,
                 .keep = c("unused"))
@@ -135,7 +135,7 @@ gsis_adi <- gsis_adi_wide %>%
 
 ```{r}
 # Load perifusion data from Jelena Kolic
-peri_jk <- read_excel(here::here("data", "Perifusion+GSIS", "2024-04-06_Jelena_all_perifusion_AUCs.xlsx")) %>%
+peri_jk <- read_excel(here::here("data", "2024-04-06_johnson_lab_perifusion.xlsx")) %>%
   dplyr::mutate(PerifusionParam = str_c("JK", PerifusionParam, sep = "_"),
                 .keep = "unused") %>%
   dplyr::mutate(across(4:ncol(.), as.numeric))
@@ -193,7 +193,7 @@ fa_peri_jk_t <- fa_peri_jk %>%
 
 ```{r}
 # Load Myriam perifusion data
-glu_peri_mh <- read_excel(here::here("data", "Perifusion+GSIS", "2024-01-25_Perifusion_FINAL DATA_For analysis_AC.xlsx")) %>%
+glu_peri_mh <- read_excel(here::here("data", "2024-01-25_bruin_lab_glucose_perifusion.xlsx")) %>%
   mutate(PerifusionParam = str_c("MH", PerifusionParam, sep = "_"),
          .keep = c("unused")) %>% 
   dplyr::mutate(across(3:ncol(.), as.numeric))
