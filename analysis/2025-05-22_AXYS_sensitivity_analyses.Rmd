@@ -47,12 +47,12 @@ library(here)
 
 ## Load sensitivity analyses data
 
-I generated dataframes that compare the correlation coefficients (r) before and after "correction" (e.g., using imputed values, removing one or more influential individuals). These files are in: *outputs/2024-10-02_ProjectGrant_sensitivity_analyses*.
+I generated dataframes that compare the correlation coefficients (r) before and after "correction" (e.g., using imputed values, removing one or more influential individuals). These files are in: *data/2024-10-02_ProjectGrant_sensitivity_analyses*.
 
 ```{r}
 # Combine all correlation files into one dataframe
 compiled_outputs <- suppressWarnings(
-  map_dfr(.x = list.files(path = here::here("outputs", "2024-10-02_ProjectGrant_sensitivity_analyses"),
+  map_dfr(.x = list.files(path = here::here("data", "2024-10-02_ProjectGrant_sensitivity_analyses"),
                           recursive = TRUE,
                           pattern = ".csv",
                           full.names = TRUE),
@@ -63,7 +63,7 @@ compiled_outputs <- suppressWarnings(
           .id = "File"))
 
 # Sample sizes per compound
-compounds_n <- read_xlsx(path = here::here("data", "2024-10-03_List_of_compounds_with_sample_size.xlsx")) %>%
+compounds_n <- read_xlsx(path = here::here("data", "2024-10-03_pops_analytes_list_with_sample_size.xlsx")) %>%
   mutate(across(c(4:ncol(.)), as.numeric))
 
 # Renaming parameters for clarity
@@ -163,7 +163,7 @@ adip_rm_421 <- pops_rchange_adip %>%
 
 ```{r}
 # load AXYS data
-axys_pops <- read_csv(here::here("outputs", "2024-08-24_ProjectGrant_excluded_outliers_for_single_analyte_analyses.csv")) %>%
+axys_pops <- read_csv(here::here("data", "2024-08-24_pops_data_outliers_excluded_for_single_analyte_analyses.csv")) %>%
   dplyr::select(-c(CONC_BLANK_adj, IS_BLANK_ADJ_CONC_HIGHER_THAN_LOD)) %>%
   mutate(BLANK_and_LOD_adj = as.numeric(BLANK_and_LOD_adj),
          File = factor(File),
@@ -180,11 +180,11 @@ axys_pops_2 <- axys_pops %>%
          COMPOUND = str_replace_all(COMPOUND, "__+", "_"))
 
 # load chemical list
-chem_list <- read_csv(here::here("data", "2022-10-18_AXYS_chemicals_list_AC.csv")) %>%
+chem_list <- read_csv(here::here("data", "2022-10-18_pops_analytes_list.csv")) %>%
   dplyr::select(Compound, Dioxin_subtype) %>%
   mutate(across(where(is.character), str_squish))
 
-chem_list_2 <- read_csv(here::here("data", "2024-10-01_AXYS_chemicals_list_with_coelutions.csv")) %>%
+chem_list_2 <- read_csv(here::here("data", "2024-10-01_pops_list_with_coelutions.csv")) %>%
   dplyr::select(-c(Dioxin_subtype, Type, Compound_rename)) %>%
   mutate(across(where(is.character), str_squish),
          Compound = make.names(Compound),
@@ -192,7 +192,7 @@ chem_list_2 <- read_csv(here::here("data", "2024-10-01_AXYS_chemicals_list_with_
          Compound = str_replace_all(Compound, "__+", "_"))
 
 # load AXYS donor metadata
-axys_metadata <- read_csv(here::here("data", "2024-08-22_donor_characteristics_FINAL.csv"), show_col_types = FALSE) %>%
+axys_metadata <- read_csv(here::here("data", "2024-08-22_donor_characteristics.csv"), show_col_types = FALSE) %>%
   mutate(BMI_category = case_when(BMI < 24.9 ~ "Lean",
                                   BMI >= 24.9 & BMI <= 29.9 ~ "Overweight",
                                   BMI > 29.9 ~ "Obese"),
@@ -210,7 +210,7 @@ axys_donors <- axys_metadata %>%
   dplyr::select(Id)
 
 # Main correlations to explore with linear model corrections
-axys_main_corr <- read_excel(here::here("data", "2024-11-07_ComparisonList_AXYS_linear_models_adjustments.xlsx"), sheet = 1) %>%
+axys_main_corr <- read_excel(here::here("data", "2024-11-07_comparison_list_pops_linear_models_adjustments.xlsx"), sheet = 1) %>%
   dplyr::select(-Comparison_with)
 
 # Subset data by tissue type
@@ -413,7 +413,7 @@ axys_pops_with_sums_adip_meta <- axys_pops_adip_log %>%
 
 ```{r}
 # load GSIS data from ADI
-gsis_adi_all_ave <- read_excel(here::here("data", "Perifusion+GSIS", "2024-05-18_IsletCore_GSIS_from_TeamGrant_website.xlsx")) %>%
+gsis_adi_all_ave <- read_excel(here::here("data", "2024-05-18_isletcore_static_gsis.xlsx")) %>%
   dplyr::mutate_at(c(4:7), as.numeric) %>%
   group_by(Donor, Cond) %>%
   dplyr::mutate(Cond = factor(Cond, levels = c("1", "2", "3")),
@@ -435,7 +435,7 @@ gsis_adi <- gsis_adi_all_ave %>%
 
 ```{r}
 # Load perifusion data from Jelena Kolic
-peri_jk <- read_excel(here::here("data", "Perifusion+GSIS", "2024-04-06_Jelena_all_perifusion_AUCs.xlsx")) %>%
+peri_jk <- read_excel(here::here("data", "2024-04-06_johnson_lab_perifusion.xlsx")) %>%
  dplyr::mutate(PerifusionParam = str_c("JK", PerifusionParam, sep = "_"),
          .keep = "unused") %>% 
   dplyr::mutate_at(c(4:148), as.numeric)
@@ -496,7 +496,7 @@ fa_peri_jk_t <- fa_peri_jk %>%
 
 ```{r}
 # Load Myriam perifusion data
-glu_peri_mh <- read_excel(here::here("data", "Perifusion+GSIS", "2024-01-25_Perifusion_FINAL DATA_For analysis_AC.xlsx")) %>%
+glu_peri_mh <- read_excel(here::here("data", "2024-01-25_bruin_lab_glucose_perifusion.xlsx")) %>%
   mutate(PerifusionParam = str_c("MH", PerifusionParam, sep = "_"),
          .keep = c("unused")) %>% 
   dplyr::mutate_at(c(3:32), as.numeric)
