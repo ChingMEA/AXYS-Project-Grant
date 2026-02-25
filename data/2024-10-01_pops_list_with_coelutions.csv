@@ -1,0 +1,64 @@
+﻿Type,Compound,Compound_rename,Dioxin_similarity,Dioxin_subtype
+Dioxin,"1,2,3,7,8,9-HXCDD ",HXCDD_1,Dioxin,Dioxin
+Dioxin,"2,3,7,8-TCDD ",TCDD,Dioxin,Dioxin
+Dioxin,"1,2,3,7,8-PECDD ",PECDD,Dioxin,Dioxin
+Dioxin,"1,2,3,4,7,8-HXCDD ",HXCDD_2,Dioxin,Dioxin
+Dioxin,"1,2,3,6,7,8-HXCDD ",HXCDD_3,Dioxin,Dioxin
+Dioxin,"1,2,3,4,6,7,8-HPCDD ",HPCDD,Dioxin,Dioxin
+Dioxin,OCDD ,OCDD,Dioxin,Dioxin
+Dioxin,"2,3,7,8-TCDF ",TCDF,Dioxin,Furan
+Dioxin,"1,2,3,7,8-PECDF ",PECDF_1,Dioxin,Furan
+Dioxin,"2,3,4,7,8-PECDF ",PECDF_2,Dioxin,Furan
+Dioxin,"1,2,3,4,7,8-HXCDF ",HXCDF_1,Dioxin,Furan
+Dioxin,"1,2,3,6,7,8-HXCDF ",HXCDF_2,Dioxin,Furan
+Dioxin,"1,2,3,7,8,9-HXCDF ",HXCDF_3,Dioxin,Furan
+Dioxin,"2,3,4,6,7,8-HXCDF ",HPCDF_1,Dioxin,Furan
+Dioxin,"1,2,3,4,6,7,8-HPCDF ",HPCDF_2,Dioxin,Furan
+Dioxin,"1,2,3,4,7,8,9-HPCDF ",HPCDF_3,Dioxin,Furan
+Dioxin,OCDF,OCDF,Dioxin,Furan
+PCB,PCB 77,PCB_77,DL,
+PCB,PCB 81,PCB_81,DL,
+PCB,PCB 105,PCB_105,DL,
+PCB,PCB 114,PCB_114,DL,
+PCB,PCB 118,PCB_118,DL,
+PCB,PCB 123,PCB_123,DL,
+PCB,PCB 126,PCB_126,DL,
+PCB,PCB 155,PCB_155,NDL,
+PCB,PCB 156,PCB_156,DL,
+PCB,PCB 157,PCB_157,DL,
+PCB,PCB 167,PCB_167,DL,
+PCB,PCB 169,PCB_169,DL,
+PCB,PCB 170,PCB_170,NDL,
+PCB,PCB 180,PCB_180,NDL,
+PCB,PCB 189,PCB_189,DL,
+PCB,PCB 192,PCB_192,NDL,
+PCB,PCB 156 + 157,PCB_156_157,DL,
+PCB,PCB 180 + 193,PCB_180_193,NDL,
+OCP,Hexachlorobenzene,Hexachlorobenzene,OCP,
+OCP,"HCH, alpha",HCH_alpha,OCP,
+OCP,"HCH, beta",HCH_beta,OCP,
+OCP,"HCH, gamma",HCH_gamma,OCP,
+OCP,"HCH, delta",HCH_delta,OCP,
+OCP,Heptachlor,Heptachlor,OCP,
+OCP,Aldrin,Aldrin,OCP,
+OCP,Heptachlor epoxide,Heptachlor_epoxide,OCP,
+OCP,"Chlordane, oxy-",Chlordane_oxy,OCP,
+OCP,"Chlordane, gamma (trans)",Chlordane_gamma_trans,OCP,
+OCP,"Chlordane, alpha (cis)",Chlordane_alpha_cis,OCP,
+OCP,"Nonachlor, trans-",Nonachlor_trans,OCP,
+OCP,"Nonachlor, cis-",Nonachlor_cis,OCP,
+OCP,alpha-Endosulphan,alpha-Endosulphan,OCP,
+OCP,beta-Endosulphan,beta-Endosulphan,OCP,
+OCP,Dieldrin,Dieldrin,OCP,
+OCP,Endrin,Endrin,OCP,
+OCP,Endrin Aldehyde,Endrin_Aldehyde,OCP,
+OCP,Endrin Ketone,Endrin_Ketone,OCP,
+OCP,Endosulphan Sulphate,Endosulphan_Sulphate,OCP,
+OCP,"2,4'-DDE",DDE_1,OCP,
+OCP,"4,4'-DDE",DDE_2,OCP,
+OCP,"2,4'-DDD",DDD_1,OCP,
+OCP,"4,4'-DDD",DDD_2,OCP,
+OCP,"2,4'-DDT",DDT_1,OCP,
+OCP,"4,4'-DDT",DDT_2,OCP,
+OCP,Methoxychlor,Methoxychlor,OCP,
+OCP,Mirex,Mirex,OCP,
