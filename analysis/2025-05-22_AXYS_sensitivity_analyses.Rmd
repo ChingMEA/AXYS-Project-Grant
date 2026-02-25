@@ -47,12 +47,12 @@ library(here)
 
 ## Load sensitivity analyses data
 
-I generated dataframes that compare the correlation coefficients (r) before and after "correction" (e.g., using imputed values, removing one or more influential individuals). These files are in: *data/2024-10-02_ProjectGrant_sensitivity_analyses*.
+I generated dataframes that compare the correlation coefficients (r) before and after "correction" (e.g., using imputed values, removing one or more influential individuals). These files are in: *data/2024-10-02_pops_sensitivity_analyses*.
 
 ```{r}
 # Combine all correlation files into one dataframe
 compiled_outputs <- suppressWarnings(
-  map_dfr(.x = list.files(path = here::here("data", "2024-10-02_ProjectGrant_sensitivity_analyses"),
+  map_dfr(.x = list.files(path = here::here("data", "2024-10-02_pops_sensitivity_analyses"),
                           recursive = TRUE,
                           pattern = ".csv",
                           full.names = TRUE),
