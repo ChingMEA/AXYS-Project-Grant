@@ -1,0 +1,74 @@
+﻿Type,Compound,Congener_Number,Dioxin_similarity,Dioxin_subtype
+Dioxin,"1,2,3,7,8,9-HXCDD ",,Dioxin,Dioxin
+Dioxin,"2,3,7,8-TCDD ",,Dioxin,Dioxin
+Dioxin,"1,2,3,7,8-PECDD ",,Dioxin,Dioxin
+Dioxin,"1,2,3,4,7,8-HXCDD ",,Dioxin,Dioxin
+Dioxin,"1,2,3,6,7,8-HXCDD ",,Dioxin,Dioxin
+Dioxin,"1,2,3,4,6,7,8-HPCDD ",,Dioxin,Dioxin
+Dioxin,OCDD ,,Dioxin,Dioxin
+Dioxin,"2,3,7,8-TCDF ",,Dioxin,Furan
+Dioxin,"1,2,3,7,8-PECDF ",,Dioxin,Furan
+Dioxin,"2,3,4,7,8-PECDF ",,Dioxin,Furan
+Dioxin,"1,2,3,4,7,8-HXCDF ",,Dioxin,Furan
+Dioxin,"1,2,3,6,7,8-HXCDF ",,Dioxin,Furan
+Dioxin,"1,2,3,7,8,9-HXCDF ",,Dioxin,Furan
+Dioxin,"2,3,4,6,7,8-HXCDF ",,Dioxin,Furan
+Dioxin,"1,2,3,4,6,7,8-HPCDF ",,Dioxin,Furan
+Dioxin,"1,2,3,4,7,8,9-HPCDF ",,Dioxin,Furan
+Dioxin,OCDF ,,Dioxin,Furan
+Dioxin,TOTAL TETRA-DIOXINS ,,Dioxin,Total
+Dioxin,TOTAL PENTA-DIOXINS ,,Dioxin,Total
+Dioxin,TOTAL HEXA-DIOXINS ,,Dioxin,Total
+Dioxin,TOTAL HEPTA-DIOXINS ,,Dioxin,Total
+Dioxin,TOTAL TETRA-FURANS ,,Dioxin,Total
+Dioxin,TOTAL PENTA-FURANS ,,Dioxin,Total
+Dioxin,TOTAL HEXA-FURANS ,,Dioxin,Total
+Dioxin,TOTAL HEPTA-FURANS ,,Dioxin,Total
+PCB,"2,4,4'-TriCB",PCB 28,Non-dioxin-like,
+PCB,"3,3',4,4'-TeCB ",PCB 77,Dioxin-like,
+PCB,"3,4,4',5-TeCB ",PCB 81,Dioxin-like,
+PCB,"2,2',4,6,6'-PeCB",PCB 104,Dioxin-like,
+PCB,"2,3,3',4,4'-PeCB ",PCB 105,Dioxin-like,
+PCB,"2,3,3',5,5'-PeCB",PCB 111,Dioxin-like,
+PCB,"2,3,4,4',5-PeCB ",PCB 114,Dioxin-like,
+PCB,"2,3',4,4',5-PeCB ",PCB 118,Dioxin-like,
+PCB,"2',3,4,4',5-PeCB ",PCB 123,Dioxin-like,
+PCB,"3,3',4,4',5-PeCB ",PCB 126,Dioxin-like,
+PCB,"2,2',4,4',6,6'-HxCB ",PCB 155,Non-dioxin-like,
+PCB,"2,3,3',4,4',5-HxCB ",PCB 156,Dioxin-like,
+PCB,"2,3,3',4,4',5'-HxCB ",PCB 157,Dioxin-like,
+PCB,"2,3',4,4',5,5'-HxCB ",PCB 167,Dioxin-like,
+PCB,"3,3',4,4',5,5'-HxCB ",PCB 169,Dioxin-like,
+PCB,"2,2',3,3',4,4',5-HpCB ",PCB 170,Non-dioxin-like,
+PCB,"2,2',3,3',5,5',6-HpCB",PCB 178,Dioxin-like,
+PCB,"2,2',3,4,4',5,5'-HpCB ",PCB 180,Non-dioxin-like,
+PCB,"2,3,3',4,4',5,5'-HpCB ",PCB 189,Dioxin-like,
+PCB,"2,3,3',4',5,5',6-HpCB ",PCB 192,Non-dioxin-like,
+OCP,Hexachlorobenzene ,,OCP,
+OCP,"HCH, alpha ",,OCP,
+OCP,"HCH, beta ",,OCP,
+OCP,"HCH, gamma ",,OCP,
+OCP,"HCH, delta ",,OCP,
+OCP,Heptachlor ,,OCP,
+OCP,Aldrin ,,OCP,
+OCP,Heptachlor Epoxide ,,OCP,
+OCP,"Chlordane, oxy- ",,OCP,
+OCP,"Chlordane, gamma (trans)",,OCP,
+OCP,"Chlordane, alpha (cis)",,OCP,
+OCP,"Nonachlor, trans- ",,OCP,
+OCP,"Nonachlor, cis- ",,OCP,
+OCP,alpha-Endosulphan ,,OCP,
+OCP,beta-Endosulphan ,,OCP,
+OCP,Dieldrin ,,OCP,
+OCP,Endrin ,,OCP,
+OCP,Endrin Aldehyde ,,OCP,
+OCP,Endrin Ketone ,,OCP,
+OCP,Endosulphan Sulphate ,,OCP,
+OCP,"2,4'-DDE ",,OCP,
+OCP,"4,4'-DDE ",,OCP,
+OCP,"2,4'-DDD ",,OCP,
+OCP,"4,4'-DDD ",,OCP,
+OCP,"2,4'-DDT ",,OCP,
+OCP,"4,4'-DDT ",,OCP,
+OCP,Methoxychlor ,,OCP,
+OCP,Mirex ,,OCP,
