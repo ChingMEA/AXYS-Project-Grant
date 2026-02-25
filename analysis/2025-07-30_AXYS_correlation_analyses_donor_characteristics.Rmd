@@ -77,10 +77,10 @@ axys_pops_2 <- axys_pops %>%
   mutate(across(where(is.character), str_squish))
 
 # load AXYS data with imputed values for true NAs (chemicals not measured by AXYS in certain donors)
-axys_pops_imputed_panc <- read_excel(here::here("outputs", "2024-09-03_pops_with_imputed_values.xlsx"), sheet = 1) %>%
+axys_pops_imputed_panc <- read_excel(here::here("data", "2024-09-03_pops_with_imputed_values.xlsx"), sheet = 1) %>%
   mutate(across(where(is.character), str_squish))
 
-axys_pops_imputed_adip <- read_excel(here::here("outputs", "2024-09-03_pops_with_imputed_values.xlsx"),sheet = 2) %>%
+axys_pops_imputed_adip <- read_excel(here::here("data", "2024-09-03_pops_with_imputed_values.xlsx"),sheet = 2) %>%
   mutate(across(where(is.character), str_squish))
 
 # load AXYS donor metadata
