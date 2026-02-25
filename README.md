@@ -2,8 +2,6 @@
 This repository contains the full R analysis pipeline used to examine how persistent organic pollutant (POP) concentrations (dioxins, PCBs, OCPs) in human pancreas and peripancreatic adipose tissues relate to markers of islet and β-cell function. The results generated from this pipeline are reported in the following publication from the Bruin Lab:  
 *“Persistent organic pollutant concentrations in human pancreas and peripancreatic adipose tissues correlate with markers of beta cell dysfunction”*
 
-**NOTE:** Raw data used in these analyses (pollutant concentrations, donor metadata, functional parameters) are NOT INCLUDED in this repository.
-
 ### Analyses included in this repository
 - **Within-tissue POP–POP correlations (pancreas, adipose)**
 - **POP–GSIS correlations across multiple functional readouts:**
@@ -37,3 +35,5 @@ Principal component analyses (PCA) and identification of influential donors.
 Partial correlations adjusting for age and/or BMI.
 7. **2025-11-21_AXYS_correlation_analyses_inter-lab_variability.Rmd**  
 Quantifying inter-laboratory variability (Bruin Lab glucose perifusion vs. ADI IsletCore static GSIS).
+
+**Note:** All files references in the pipeline are found in **/data**.
